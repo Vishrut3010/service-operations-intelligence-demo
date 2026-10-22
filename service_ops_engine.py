@@ -924,14 +924,18 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     else:
         fr = pd.DataFrame()
     if not fr.empty:
-        labels = [textwrap.shorten(clean_text(x), width=16, placeholder="…") for x in fr["Franchise"].astype(str)]
+        # Show complete franchise names by wrapping them onto multiple lines instead of truncating.
+        labels = [textwrap.fill(clean_text(x), width=14, break_long_words=False, break_on_hyphens=False)
+                  for x in fr["Franchise"].astype(str)]
         y = np.arange(len(fr))
         aged_over_two = fr["Aged >2 Days"].to_numpy()
         ax_fr.barh(y, aged_over_two, color="#3A78A5", height=0.56)
         ax_fr.set_yticks(y, labels)
         ax_fr.invert_yaxis()
         style_axis(ax_fr, "Franchise calls pending >2 days")
-        ax_fr.tick_params(axis="y", labelsize=8.2, colors=ink)
+        ax_fr.tick_params(axis="y", labelsize=7.6, colors=ink, pad=5)
+        for tick_label in ax_fr.get_yticklabels():
+            tick_label.set_multialignment("right")
         xmax = max(float(aged_over_two.max()), 1)
         ax_fr.set_xlim(0, xmax * 1.18)
         for yy, count in zip(y, aged_over_two):
