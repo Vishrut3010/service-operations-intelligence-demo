@@ -100,6 +100,9 @@ def _classify(df: pd.DataFrame) -> str:
         return "unknown"
     if "feedback" in columns and "feedbackdate" in columns:
         return "customer_satisfaction"
+    # Soft Closure (All Status) exports are used to reconcile calls closed by the snapshot time.
+    if "softclosuredate" in columns and "status" in columns:
+        return "soft_closure"
     # Calls Registered exports also contain Days Old and repeatcall flag, so test them first.
     if "callbookdate" in columns and ("assignon" in columns or "closedtime" in columns):
         return "calls_registered"
@@ -138,7 +141,7 @@ def parse_report(filename: str, file_bytes: bytes, upload_order: int = 0) -> Dic
     df = df.dropna(how="all").reset_index(drop=True)
     report_type = _classify(df)
     if report_type == "unknown":
-        raise ValueError("The file was read, but its report type could not be identified. Expected Pending Calls, Calls Registered, or Customer Satisfaction.")
+        raise ValueError("The file was read, but its report type could not be identified. Expected Pending Calls, Calls Registered, Soft Closure, or Customer Satisfaction.")
 
     filename_dt = _filename_timestamp(filename)
     if filename_dt is not None:
@@ -345,34 +348,135 @@ def _pending_status_map(df: pd.DataFrame) -> Dict[str, str]:
     return out
 
 
-def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    # Keep the hourly movement numbers on the same eligible call-type population as the Top 20.
-    cur_raw = filter_pending_call_types(current["df"])
-    cur_ticket = get_ticket_col(cur_raw)
+def _valid_datetime_series(series: pd.Series) -> pd.Series:
+    """Parse mixed Excel timestamps while treating 1900 placeholder dates as missing."""
+    parsed = pd.to_datetime(series, errors="coerce", format="mixed")
+    try:
+        return parsed.where(parsed.notna() & (parsed.dt.year > 1900))
+    except Exception:
+        return pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+
+
+def soft_closure_ticket_ids_as_of(reports: List[Dict[str, Any]], snapshot_dt: pd.Timestamp) -> set:
+    """Ticket IDs with a soft-closure event at or before the pending snapshot time."""
+    closed_ids = set()
+    for report in reports:
+        if report.get("report_type") != "soft_closure":
+            continue
+        df = report.get("df", pd.DataFrame())
+        ticket_col = get_ticket_col(df)
+        if not ticket_col or df.empty:
+            continue
+        soft_col = find_col(df, ["Soft Closure Date", "Soft Closed Date", "SoftClosureDate", "Closure Date"])
+        closed_col = find_col(df, ["ClosedDate", "Closed Date", "Closed Time", "Closed Timestamp"])
+        if soft_col:
+            event_ts = _valid_datetime_series(df[soft_col])
+        else:
+            event_ts = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]")
+        if closed_col:
+            event_ts = event_ts.fillna(_valid_datetime_series(df[closed_col]))
+        for idx, row in df.iterrows():
+            ticket = clean_text(row.get(ticket_col, ""))
+            if not ticket:
+                continue
+            event_time = event_ts.loc[idx] if idx in event_ts.index else pd.NaT
+            if pd.notna(event_time):
+                if pd.Timestamp(event_time) <= pd.Timestamp(snapshot_dt):
+                    closed_ids.add(ticket)
+            else:
+                # Conservative fallback only when event timestamps are absent: use report-period timing.
+                period_end = report.get("period_end")
+                if period_end is not None and pd.Timestamp(period_end).date() < pd.Timestamp(snapshot_dt).date():
+                    closed_ids.add(ticket)
+                elif (period_end is not None and pd.Timestamp(period_end).date() == pd.Timestamp(snapshot_dt).date()
+                      and pd.Timestamp(report.get("snapshot_dt")) <= pd.Timestamp(snapshot_dt)):
+                    closed_ids.add(ticket)
+    return closed_ids
+
+
+def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str, Any]]] = None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Return one row per active pending ticket plus its source rows and exclusion stats.
+
+    Exclusions: Courtesy / Dealer Defective call types, tickets soft-closed at or before
+    the snapshot timestamp, and tickets whose status is Negative Response from Customer.
+    """
+    reports = reports or [report]
+    source_df = report.get("df", pd.DataFrame())
+    by_type = filter_pending_call_types(source_df)
+    ticket_col = get_ticket_col(by_type)
+    if not ticket_col:
+        return pd.DataFrame(columns=list(by_type.columns)), by_type.iloc[0:0].copy(), {
+            "source_distinct_tickets": 0, "active_tickets": 0,
+            "soft_closed_tickets": 0, "negative_response_tickets": 0,
+            "excluded_ticket_ids": set(), "active_ticket_ids": set(),
+        }
+
+    grouped = summarize_pending_rows(by_type)
+    grouped_ticket_col = get_ticket_col(grouped)
+    source_ids = {clean_text(v) for v in grouped[grouped_ticket_col].tolist() if clean_text(v)}
+
+    # If any source row for a ticket carries a negative-response status, exclude the whole ticket.
+    status_col_raw = find_col(by_type, ["Status"])
+    negative_ids = set()
+    if status_col_raw:
+        negative_rows = by_type[by_type[status_col_raw].map(lambda v: "negativeresponse" in norm(v))]
+        negative_ids = {clean_text(v) for v in negative_rows[ticket_col].tolist() if clean_text(v)}
+
+    snapshot_dt = pd.Timestamp(report.get("snapshot_dt"))
+    soft_closed_ids = soft_closure_ticket_ids_as_of(reports, snapshot_dt)
+    soft_matched = source_ids & soft_closed_ids
+    negative_only = negative_ids - soft_matched
+    excluded_ids = soft_matched | negative_ids
+    active_ids = source_ids - excluded_ids
+    active_grouped = grouped[grouped[grouped_ticket_col].map(clean_text).isin(active_ids)].copy().reset_index(drop=True)
+    source_ticket_ids = by_type[ticket_col].map(clean_text)
+    active_source_rows = by_type[source_ticket_ids.isin(active_ids)].copy().reset_index(drop=True)
+
+    return active_grouped, active_source_rows, {
+        "source_distinct_tickets": len(source_ids),
+        "active_tickets": len(active_ids),
+        "soft_closed_tickets": len(soft_matched),
+        "negative_response_tickets": len(negative_only),
+        "excluded_ticket_ids": excluded_ids,
+        "active_ticket_ids": active_ids,
+        "negative_response_ids": negative_only,
+        "soft_closed_ids": soft_matched,
+    }
+
+
+def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, Any],
+                        reports: Optional[List[Dict[str, Any]]] = None) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Compare only tickets active at each snapshot, using closure timestamps when available."""
+    reports = reports or [current] + ([previous] if previous else [])
+    cur_grouped, _, _ = active_pending_data(current, reports)
+    cur_ticket = get_ticket_col(cur_grouped)
     if not cur_ticket:
         return pd.DataFrame(), {"new": 0, "continuing": 0, "missing": 0, "status_changed": 0, "age_increased": 0}
     cur_map = {}
-    cur_grouped = summarize_pending_rows(cur_raw)
-    cur_tcol = get_ticket_col(cur_grouped)
     age_col_cur = find_col(cur_grouped, ["Days Old"])
     exec_col_cur = find_col(cur_grouped, ["Service Executive Name"])
+    status_col_cur = find_col(cur_grouped, ["Status"])
     for _, r in cur_grouped.iterrows():
-        key = clean_text(r.get(cur_tcol, ""))
+        key = clean_text(r.get(cur_ticket, ""))
+        if not key:
+            continue
         cur_map[key] = {
-            "status": clean_text(r.get(find_col(cur_grouped, ["Status"]), "")),
+            "status": clean_text(r.get(status_col_cur, "")) if status_col_cur else "",
             "age": pd.to_numeric(pd.Series([r.get(age_col_cur, 0)]), errors="coerce").fillna(0).iloc[0] if age_col_cur else 0,
             "executive": clean_text(r.get(exec_col_cur, "")) if exec_col_cur else "",
         }
+
     prev_map = {}
     if previous:
-        prev_raw = filter_pending_call_types(previous["df"])
-        prev_grouped = summarize_pending_rows(prev_raw)
+        prev_grouped, _, _ = active_pending_data(previous, reports)
         prev_tcol = get_ticket_col(prev_grouped)
         age_col_prev = find_col(prev_grouped, ["Days Old"])
         exec_col_prev = find_col(prev_grouped, ["Service Executive Name"])
         status_col_prev = find_col(prev_grouped, ["Status"])
         for _, r in prev_grouped.iterrows():
             key = clean_text(r.get(prev_tcol, ""))
+            if not key:
+                continue
             prev_map[key] = {
                 "status": clean_text(r.get(status_col_prev, "")) if status_col_prev else "",
                 "age": pd.to_numeric(pd.Series([r.get(age_col_prev, 0)]), errors="coerce").fillna(0).iloc[0] if age_col_prev else 0,
@@ -383,15 +487,13 @@ def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, A
     records = []
     status_changed = age_increased = 0
     for key in sorted(prev_ids | cur_ids):
-        prev = prev_map.get(key)
-        cur = cur_map.get(key)
-        if prev and cur:
-            status_diff = bool(prev["status"] and cur["status"] and norm(prev["status"]) != norm(cur["status"]))
-            age_diff = float(cur["age"]) > float(prev["age"])
-            if status_diff:
-                status_changed += 1
-            if age_diff:
-                age_increased += 1
+        prev_item = prev_map.get(key)
+        cur_item = cur_map.get(key)
+        if prev_item and cur_item:
+            status_diff = bool(prev_item["status"] and cur_item["status"] and norm(prev_item["status"]) != norm(cur_item["status"]))
+            age_diff = float(cur_item["age"]) > float(prev_item["age"])
+            status_changed += int(status_diff)
+            age_increased += int(age_diff)
             if status_diff and age_diff:
                 movement = "Present; status changed and age increased"
             elif status_diff:
@@ -400,19 +502,19 @@ def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, A
                 movement = "Present; age increased"
             else:
                 movement = "Present in both snapshots"
-        elif cur:
+        elif cur_item:
             movement = "Newly present in latest pending report"
         else:
             movement = "No longer present in latest report (not proof of closure)"
         records.append({
             "Ticket No": key,
             "Movement": movement,
-            "Previous Status": prev["status"] if prev else "",
-            "Current Status": cur["status"] if cur else "",
-            "Previous Days Old": prev["age"] if prev else "",
-            "Current Days Old": cur["age"] if cur else "",
-            "Previous Executive": prev["executive"] if prev else "",
-            "Current Executive": cur["executive"] if cur else "",
+            "Previous Status": prev_item["status"] if prev_item else "",
+            "Current Status": cur_item["status"] if cur_item else "",
+            "Previous Days Old": prev_item["age"] if prev_item else "",
+            "Current Days Old": cur_item["age"] if cur_item else "",
+            "Previous Executive": prev_item["executive"] if prev_item else "",
+            "Current Executive": cur_item["executive"] if cur_item else "",
         })
     counts = {
         "new": len(cur_ids - prev_ids),
@@ -422,7 +524,6 @@ def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, A
         "age_increased": age_increased,
     }
     return pd.DataFrame(records), counts
-
 
 def _latest_by_type(reports: List[Dict[str, Any]], report_type: str, on_or_before: Optional[date] = None) -> Optional[Dict[str, Any]]:
     items = [r for r in reports if r["report_type"] == report_type]
@@ -454,13 +555,27 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
     prev_candidates = [r for r in pending_reports if (r["snapshot_dt"], r["upload_order"]) < (current["snapshot_dt"], current["upload_order"])]
     previous = prev_candidates[-1] if prev_candidates else None
 
-    current_eligible_rows = filter_pending_call_types(current["df"])
-    current_ticket_df = summarize_pending_rows(current_eligible_rows)
-    # Courtesy Call / Courtesy Visit and Dealer Defective call types are excluded from all pending-call KPIs and outputs.
+    current_type_rows = filter_pending_call_types(current["df"])
+    current_ticket_df, current_eligible_rows, current_exclusion_stats = active_pending_data(current, reports)
     # Pending Reason is intentionally excluded from analysis: it is often blank/inconsistent in source exports.
     current_ticket_df = current_ticket_df.drop(columns=[c for c in current_ticket_df.columns if norm(c) == "pendingreason"], errors="ignore")
     priorities = enrich_pending(current_ticket_df, current["snapshot_dt"])
-    comparisons, movement_counts = snapshot_comparison(previous, current)
+    top20 = priorities.head(20).copy()
+    executive_name_col = find_col(top20, ["Service Executive Name"])
+    if len(top20):
+        if executive_name_col:
+            top20_executives = top20[executive_name_col].map(lambda v: clean_text(v) or "Unspecified")
+        else:
+            top20_executives = pd.Series(["Unspecified"] * len(top20), index=top20.index)
+        top20_exec_counts = top20_executives.value_counts()
+        top20["Executive % of Top 20"] = top20_executives.map(top20_exec_counts).astype(float) * 100.0 / len(top20)
+        top20_executive_summary = pd.DataFrame({"Executive": top20_exec_counts.index, "Top 20 Calls": top20_exec_counts.values})
+        top20_executive_summary["Share of Top 20 (%)"] = top20_executive_summary["Top 20 Calls"] * 100.0 / len(top20)
+        top20_executive_summary = top20_executive_summary.sort_values(["Top 20 Calls", "Executive"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    else:
+        top20["Executive % of Top 20"] = pd.Series(dtype=float)
+        top20_executive_summary = pd.DataFrame(columns=["Executive", "Top 20 Calls", "Share of Top 20 (%)"])
+    comparisons, movement_counts = snapshot_comparison(previous, current, reports)
 
     csat_report = _latest_by_type(reports, "customer_satisfaction", analysis_date)
     reg_report = _latest_by_type(reports, "calls_registered", analysis_date)
@@ -492,22 +607,43 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
 
     csat_feedback_col = find_col(csat, ["FeedBack", "Feedback", "Feedback Score"]) if not csat.empty else None
     csat_summary = pd.DataFrame(columns=["Feedback", "Count", "Share %"])
-    csat_metrics = {"total": 0, "happy": 0, "ok": 0, "not_happy": 0, "happy_pct": None, "not_happy_pct": None}
+    csat_metrics = {
+        "total": 0, "source_rows": 0, "blank": 0,
+        "happy": 0, "ok": 0, "not_happy": 0,
+        "happy_pct": None, "not_happy_pct": None,
+        "css_pct": None, "css_pct_rounded": None,
+    }
     if csat_feedback_col:
         feedback = csat[csat_feedback_col].map(lambda v: clean_text(v).upper())
-        counts = feedback.value_counts(dropna=False)
-        total = int(counts.sum())
-        csat_summary = pd.DataFrame([{"Feedback": k if k else "Blank", "Count": int(v), "Share %": round(100 * int(v) / total, 2) if total else 0} for k, v in counts.items()])
+        # CSS denominator is actual nonblank feedback responses, not the number of happy responses.
+        # Formula supplied by the user: (HAPPY - NOT HAPPY) / TOTAL FEEDBACK * 100.
+        valid_feedback = feedback[feedback != ""]
+        counts = valid_feedback.value_counts()
+        total = int(len(valid_feedback))
+        csat_summary = pd.DataFrame([
+            {"Feedback": k, "Count": int(v), "Share %": round(100 * int(v) / total, 2) if total else 0}
+            for k, v in counts.items()
+        ])
+        happy_count = int((valid_feedback == "HAPPY").sum())
+        ok_count = int((valid_feedback == "OK").sum())
+        not_happy_count = int((valid_feedback == "NOT HAPPY").sum())
+        css_pct = (100 * (happy_count - not_happy_count) / total) if total else None
         csat_metrics = {
             "total": total,
-            "happy": int((feedback == "HAPPY").sum()),
-            "ok": int((feedback == "OK").sum()),
-            "not_happy": int((feedback == "NOT HAPPY").sum()),
-            "happy_pct": round(100 * (feedback == "HAPPY").sum() / total, 2) if total else None,
-            "not_happy_pct": round(100 * (feedback == "NOT HAPPY").sum() / total, 2) if total else None,
+            "source_rows": int(len(csat)),
+            "blank": int((feedback == "").sum()),
+            "happy": happy_count,
+            "ok": ok_count,
+            "not_happy": not_happy_count,
+            "happy_pct": round(100 * happy_count / total, 2) if total else None,
+            "not_happy_pct": round(100 * not_happy_count / total, 2) if total else None,
+            "css_pct": round(css_pct, 2) if css_pct is not None else None,
+            # Management image rounds CSS to the nearest whole percentage point.
+            "css_pct_rounded": int(round(css_pct)) if css_pct is not None else None,
         }
 
     # Compare the latest Customer Satisfaction snapshot with the previous available snapshot.
+    # Shares show feedback mix; CSS itself uses (Happy - Not Happy) / total nonblank feedback × 100.
     csat_items = sorted(
         [r for r in reports if r["report_type"] == "customer_satisfaction" and
          (r["snapshot_dt"] <= bound or (r["period_end"] is not None and r["period_end"].date() <= analysis_date))],
@@ -519,14 +655,16 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
         if prior_items:
             csat_previous_report = prior_items[-1]
     csat_comparison = pd.DataFrame(columns=["Feedback", "Previous Count", "Current Count", "Count Change", "Previous Share %", "Current Share %", "Share Change (pp)"])
-    csat_movement = {"previous_rows": None, "current_rows": len(csat), "new_tickets": None, "missing_tickets": None, "happy_delta_pp": None, "not_happy_delta_pp": None}
+    csat_movement = {"previous_rows": None, "current_rows": len(csat), "new_tickets": None, "missing_tickets": None, "happy_delta_pp": None, "not_happy_delta_pp": None, "css_delta_pp": None}
     if csat_previous_report is not None:
         prev_df = csat_previous_report["df"].copy()
         prev_fb_col = find_col(prev_df, ["FeedBack", "Feedback", "Feedback Score"])
         current_fb = csat[csat_feedback_col].map(lambda v: clean_text(v).upper()) if csat_feedback_col else pd.Series(dtype=str)
         prev_fb = prev_df[prev_fb_col].map(lambda v: clean_text(v).upper()) if prev_fb_col else pd.Series(dtype=str)
-        prev_total, curr_total = len(prev_fb), len(current_fb)
-        prev_counts, curr_counts = prev_fb.value_counts(), current_fb.value_counts()
+        prev_valid = prev_fb[prev_fb != ""]
+        current_valid = current_fb[current_fb != ""]
+        prev_total, curr_total = len(prev_valid), len(current_valid)
+        prev_counts, curr_counts = prev_valid.value_counts(), current_valid.value_counts()
         feedback_labels = sorted(set(prev_counts.index.tolist()) | set(curr_counts.index.tolist()))
         comp_rows = []
         for label in feedback_labels:
@@ -536,19 +674,22 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
             comp_rows.append({"Feedback": label or "Blank", "Previous Count": p_count, "Current Count": c_count,
                               "Count Change": c_count - p_count, "Previous Share %": p_share,
                               "Current Share %": c_share, "Share Change (pp)": round(c_share - p_share, 2)})
-        csat_comparison = pd.DataFrame(comp_rows).sort_values("Current Count", ascending=False).reset_index(drop=True)
+        csat_comparison = pd.DataFrame(comp_rows).sort_values("Current Count", ascending=False).reset_index(drop=True) if comp_rows else pd.DataFrame(columns=["Feedback", "Previous Count", "Current Count", "Count Change", "Previous Share %", "Current Share %", "Share Change (pp)"])
         prev_ticket_col, curr_ticket_col = get_ticket_col(prev_df), get_ticket_col(csat)
         prev_ids = {clean_text(v) for v in prev_df[prev_ticket_col].tolist() if clean_text(v)} if prev_ticket_col else set()
         curr_ids = {clean_text(v) for v in csat[curr_ticket_col].tolist() if clean_text(v)} if curr_ticket_col else set()
-        prev_happy_share = 100 * (prev_fb == "HAPPY").sum() / prev_total if prev_total else None
-        curr_happy_share = 100 * (current_fb == "HAPPY").sum() / curr_total if curr_total else None
-        prev_not_happy_share = 100 * (prev_fb == "NOT HAPPY").sum() / prev_total if prev_total else None
-        curr_not_happy_share = 100 * (current_fb == "NOT HAPPY").sum() / curr_total if curr_total else None
+        prev_happy_share = 100 * (prev_valid == "HAPPY").sum() / prev_total if prev_total else None
+        curr_happy_share = 100 * (current_valid == "HAPPY").sum() / curr_total if curr_total else None
+        prev_not_happy_share = 100 * (prev_valid == "NOT HAPPY").sum() / prev_total if prev_total else None
+        curr_not_happy_share = 100 * (current_valid == "NOT HAPPY").sum() / curr_total if curr_total else None
+        prev_css = 100 * (((prev_valid == "HAPPY").sum()) - ((prev_valid == "NOT HAPPY").sum())) / prev_total if prev_total else None
+        curr_css = 100 * (((current_valid == "HAPPY").sum()) - ((current_valid == "NOT HAPPY").sum())) / curr_total if curr_total else None
         csat_movement = {
             "previous_rows": prev_total, "current_rows": curr_total,
             "new_tickets": len(curr_ids - prev_ids), "missing_tickets": len(prev_ids - curr_ids),
             "happy_delta_pp": round(round(curr_happy_share, 2) - round(prev_happy_share, 2), 2) if prev_happy_share is not None and curr_happy_share is not None else None,
             "not_happy_delta_pp": round(round(curr_not_happy_share, 2) - round(prev_not_happy_share, 2), 2) if prev_not_happy_share is not None and curr_not_happy_share is not None else None,
+            "css_delta_pp": round(curr_css - prev_css, 2) if prev_css is not None and curr_css is not None else None,
         }
 
     def count_distinct(df: pd.DataFrame) -> int:
@@ -605,11 +746,12 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
         closed_ts = closed_ts.where(closed_ts.dt.year > 1900)
         closed_count = int((closed_ts.dt.date == analysis_date).sum())
 
-    # Data-quality indicators use fields that are generally consistently recorded.
+    # Data-quality indicators use the final active queue, while ticketless source rows remain flagged.
     missing_exec_count = int(priorities["Missing Executive"].sum()) if "Missing Executive" in priorities else 0
     missing_tech_count = int(priorities["Missing Technician"].sum()) if "Missing Technician" in priorities else 0
     missing_schedule_count = int(priorities["Scheduled Date"].map(lambda v: not bool(clean_text(v))).sum()) if "Scheduled Date" in priorities else len(priorities)
-    missing_ticket_count = int(sum(not clean_text(v) for v in current_eligible_rows[get_ticket_col(current_eligible_rows)])) if get_ticket_col(current_eligible_rows) else len(current_eligible_rows)
+    current_raw_ticket_col = get_ticket_col(current_type_rows)
+    missing_ticket_count = int(current_type_rows[current_raw_ticket_col].map(lambda v: not bool(clean_text(v))).sum()) if current_raw_ticket_col else len(current_type_rows)
     source_row_duplicates = max(0, len(current_eligible_rows) - len(priorities))
     excluded_pending_rows = int(excluded_pending_call_type_mask(current["df"]).sum())
     excluded_pending_tickets = distinct_ticket_count(current["df"].loc[excluded_pending_call_type_mask(current["df"])])
@@ -619,27 +761,41 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
         "missing_schedule": missing_schedule_count,
         "missing_ticket_number": missing_ticket_count,
         "rows_beyond_distinct_tickets": source_row_duplicates,
+        "soft_closed_tickets_excluded": current_exclusion_stats["soft_closed_tickets"],
+        "negative_response_tickets_excluded": current_exclusion_stats["negative_response_tickets"],
+        "current_source_distinct_tickets": current_exclusion_stats["source_distinct_tickets"],
     }
 
-    # Data quality / provenance notes.
+    # Data-quality / provenance notes. Eligible counts mean active tickets after queue reconciliation.
     dq_rows = []
     for r in reports:
         if r["report_type"] == "pending_calls":
-            tcol = get_ticket_col(r["df"])
-            unique = count_distinct(r["df"])
-            eligible_df = filter_pending_call_types(r["df"])
-            excluded_mask = excluded_pending_call_type_mask(r["df"])
-            excluded_df = r["df"].loc[excluded_mask]
+            source_df = r["df"]
+            unique = count_distinct(source_df)
+            active_grouped, active_rows, report_exclusions = active_pending_data(r, reports)
+            all_ids = _group_ticket_ids(summarize_pending_rows(filter_pending_call_types(source_df)))
+            active_ids = report_exclusions["active_ticket_ids"]
             dq_rows.append({
-                "File": r["filename"], "Report Type": r["report_type"], "Source Rows": len(r["df"]),
-                "Distinct Tickets": unique, "Eligible Rows": len(eligible_df),
-                "Eligible Tickets": distinct_ticket_count(eligible_df),
-                "Excluded Rows": int(excluded_mask.sum()),
-                "Excluded Tickets": distinct_ticket_count(excluded_df),
-                "Rows beyond distinct tickets": max(0, len(eligible_df) - distinct_ticket_count(eligible_df)),
+                "File": r["filename"], "Report Type": r["report_type"], "Source Rows": len(source_df),
+                "Distinct Tickets": unique, "Eligible Rows": len(active_rows),
+                "Eligible Tickets": len(active_grouped),
+                "Excluded Rows": max(0, len(source_df) - len(active_rows)),
+                "Excluded Tickets": len(all_ids - active_ids),
+                "Rows beyond distinct tickets": max(0, len(active_rows) - len(active_grouped)),
                 "Period": r["metadata"], "Snapshot Used For": r["snapshot_dt"].strftime("%Y-%m-%d %H:%M"),
                 "Timestamp Basis": r["snapshot_source"],
-                "Note": "Courtesy Call/Courtesy Visit and Dealer Defective call types are excluded from pending analysis. Other repeated ticket rows may represent multiple spare/additive/accessory details; component values are aggregated.",
+                "Note": (f"Active queue excludes {report_exclusions['soft_closed_tickets']} ticket(s) soft-closed by this snapshot and "
+                         f"{report_exclusions['negative_response_tickets']} ticket(s) marked Negative Response from Customer; "
+                         "Courtesy/Courtesy Visit and Dealer Defective call types are also excluded."),
+            })
+        elif r["report_type"] == "soft_closure":
+            dq_rows.append({
+                "File": r["filename"], "Report Type": r["report_type"], "Source Rows": len(r["df"]),
+                "Distinct Tickets": count_distinct(r["df"]), "Eligible Rows": len(r["df"]),
+                "Eligible Tickets": count_distinct(r["df"]), "Excluded Rows": 0, "Excluded Tickets": 0,
+                "Rows beyond distinct tickets": max(0, len(r["df"]) - count_distinct(r["df"])),
+                "Period": r["metadata"], "Snapshot Used For": r["snapshot_dt"].strftime("%Y-%m-%d %H:%M"),
+                "Timestamp Basis": r["snapshot_source"], "Note": "Used to remove tickets with soft-closure event timestamps at or before each Pending Call snapshot.",
             })
         else:
             dq_rows.append({
@@ -651,8 +807,9 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
                 "Timestamp Basis": r["snapshot_source"], "Note": "Source report classified from its column headers.",
             })
     dq_rows += [
-        {"File": "Analysis rule", "Report Type": "Age-only ordering", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Days Old descending; oldest first", "Snapshot Used For": "", "Timestamp Basis": "Days Old column; Call Book Date used only if Days Old is blank", "Note": "The only call-ordering key is age. Equal-age tickets retain source order. Courtesy/Courtesy Visit and Dealer Defective calls are excluded."},
-        {"File": "Analysis rule", "Report Type": "Snapshot comparison", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "New / continuing / no longer present / status changed / age increased", "Snapshot Used For": "", "Timestamp Basis": "Ticket-number matching on eligible call types", "Note": "A ticket absent from a later Pending Call export is not automatically labelled closed."},
+        {"File": "Analysis rule", "Report Type": "Age-only ordering", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Days Old descending; oldest first", "Snapshot Used For": "", "Timestamp Basis": "Days Old column; Call Book Date used only if Days Old is blank", "Note": "The only call-ordering key is age. Equal-age tickets retain source order."},
+        {"File": "Analysis rule", "Report Type": "Active pending queue", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Active calls only", "Snapshot Used For": "", "Timestamp Basis": "Soft Closure Date / ClosedDate compared with Pending Call snapshot time", "Note": "Exclude Courtesy and Dealer Defective types, tickets soft-closed by snapshot time, and tickets marked Negative Response from Customer."},
+        {"File": "Analysis rule", "Report Type": "Snapshot comparison", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "New / continuing / no longer present / status changed / age increased", "Snapshot Used For": "", "Timestamp Basis": "Ticket-number matching on the active queue for each snapshot", "Note": "A ticket absent from a later Pending Call export is not automatically labelled closed."},
     ]
 
     return {
@@ -663,11 +820,15 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
         "previous_pending_report": previous,
         "current_pending_rows": len(current_eligible_rows),
         "current_unique_tickets": len(priorities),
-        "prior_unique_tickets": len(summarize_pending_rows(filter_pending_call_types(previous["df"]))) if previous else None,
+        "current_source_distinct_tickets": current_exclusion_stats["source_distinct_tickets"],
+        "soft_closed_tickets_excluded": current_exclusion_stats["soft_closed_tickets"],
+        "negative_response_tickets_excluded": current_exclusion_stats["negative_response_tickets"],
+        "prior_unique_tickets": len(active_pending_data(previous, reports)[0]) if previous else None,
         "excluded_pending_rows": excluded_pending_rows,
         "excluded_pending_tickets": excluded_pending_tickets,
         "priorities": priorities,
-        "top20": priorities.head(20).copy(),
+        "top20": top20,
+        "top20_executive_summary": top20_executive_summary,
         "comparison": comparisons,
         "movement_counts": movement_counts,
         "csat_report": csat_report,
@@ -738,6 +899,7 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
         ("Technician Name", "Technician", 0.110),
         ("Call Type", "Call Type", 0.105),
         ("Status", "Status", 0.100),
+        ("Executive % of Top 20", "Exec. % of Top 20", 0.080),
     ]
     present = [(src, label, width) for src, label, width in col_def if src in data.columns]
     total = sum(c[2] for c in present)
@@ -748,6 +910,11 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
         vals = []
         for src, _, _ in present:
             value = clean_text(row.get(src, ""))
+            if src == "Executive % of Top 20" and value:
+                try:
+                    value = f"{float(value):.1f}%"
+                except (TypeError, ValueError):
+                    pass
             limit = {
                 "Franchise Name": 30,
                 "Customer Name": 26,
@@ -773,7 +940,7 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
     table.auto_set_font_size(False)
     table.set_fontsize(8.2)
 
-    centered = {"Order", "Days Old"}
+    centered = {"Order", "Days Old", "Executive % of Top 20"}
     for (r, c), cell in table.get_celld().items():
         cell.set_edgecolor("#D0D4D8")
         cell.set_linewidth(0.55)
@@ -795,7 +962,7 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
                 cell.get_text().set_weight("bold")
 
     fig.text(0.018, 0.064,
-             "Sorted only by Days Old (highest to lowest). Equal-age calls retain their order in the source report.",
+             "Sorted only by Days Old, oldest first. Exec. % shows that executive's share of the 20 calls displayed.",
              fontsize=9, color="#4F5963")
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -833,14 +1000,14 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     # KPI tiles have consistent widths, baselines, and padding.
     current = analysis["current_unique_tickets"]
     mc = analysis["movement_counts"]
-    happy = analysis["csat_metrics"]["happy_pct"]
+    css_rounded = analysis["csat_metrics"].get("css_pct_rounded")
     kpis = [
         ("PENDING TICKETS", f"{current:,}", navy),
         ("AGED 7+ DAYS", f"{analysis['older_7']:,}", amber),
         ("ESCALATED", f"{analysis['escalated']:,}", red),
         ("REPEAT FLAGS", f"{analysis['repeat_calls']:,}", teal),
         ("NEW IN LATEST SNAPSHOT", f"{mc['new']:,}" if analysis["previous_pending_report"] else "—", "#2E6D9C"),
-        ("HAPPY FEEDBACK", f"{happy:.1f}%" if happy is not None else "—", green),
+        ("CSS", f"{css_rounded}%" if css_rounded is not None else "—", green),
     ]
     x0, step, card_w = 0.04, 0.155, 0.143
     for i, (label, value, value_color) in enumerate(kpis):
@@ -887,33 +1054,41 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
                     transform=ax_age.transAxes, va="center")
 
     ax_exec = fig.add_axes([0.575, 0.545, 0.35, 0.205])
-    ex = analysis["executive_summary"].copy()
+    ex = analysis.get("top20_executive_summary", pd.DataFrame()).copy()
     if not ex.empty:
-        ex["Pending Tickets"] = pd.to_numeric(ex["Pending Tickets"], errors="coerce").fillna(0)
-        ex["Aged 7+ Days"] = pd.to_numeric(ex["Aged 7+ Days"], errors="coerce").fillna(0)
-        ex = ex.sort_values("Pending Tickets", ascending=False, kind="stable").head(5).copy()
-        labels = [textwrap.shorten(clean_text(x), width=21, placeholder="…") for x in ex["Executive"].astype(str)]
+        ex["Top 20 Calls"] = pd.to_numeric(ex["Top 20 Calls"], errors="coerce").fillna(0)
+        ex["Share of Top 20 (%)"] = pd.to_numeric(ex["Share of Top 20 (%)"], errors="coerce").fillna(0)
+        ex = ex.sort_values(["Top 20 Calls", "Executive"], ascending=[False, True], kind="stable").copy()
+        if len(ex) > 6:
+            top = ex.head(5).copy()
+            other = ex.iloc[5:]
+            top = pd.concat([top, pd.DataFrame([{
+                "Executive": "Other executives",
+                "Top 20 Calls": int(other["Top 20 Calls"].sum()),
+                "Share of Top 20 (%)": float(other["Share of Top 20 (%)"].sum()),
+            }])], ignore_index=True)
+            ex = top
+        labels = [textwrap.fill(clean_text(x), width=19, break_long_words=False) for x in ex["Executive"].astype(str)]
         y = np.arange(len(ex))
-        totals = ex["Pending Tickets"].to_numpy()
-        aged = ex["Aged 7+ Days"].to_numpy()
+        totals = ex["Top 20 Calls"].to_numpy(dtype=float)
+        shares = ex["Share of Top 20 (%)"].to_numpy(dtype=float)
         ax_exec.barh(y, totals, color="#3A78A5", height=0.56)
         ax_exec.set_yticks(y, labels)
         ax_exec.invert_yaxis()
-        style_axis(ax_exec, "Executive workload")
-        ax_exec.tick_params(axis="y", labelsize=8.1, colors=ink)
+        style_axis(ax_exec, "Top 20 oldest calls by executive")
+        ax_exec.tick_params(axis="y", labelsize=7.5, colors=ink, pad=4)
         xmax = max(float(totals.max()), 1)
-        ax_exec.set_xlim(0, xmax * 1.45)
-        for yy, total, aged_v in zip(y, totals, aged):
-            ax_exec.text(total + xmax * 0.025, yy,
-                         f"{int(total):,} total  ·  {int(aged_v):,} aged 7+",
-                         va="center", ha="left", fontsize=7.8, color=ink)
+        ax_exec.set_xlim(0, xmax * 1.36)
+        for yy, count, share in zip(y, totals, shares):
+            ax_exec.text(count + xmax * 0.025, yy, f"{int(count):,}  ·  {share:.1f}%",
+                         va="center", ha="left", fontsize=7.7, color=ink, weight="bold")
         ax_exec.grid(axis="y", visible=False)
     else:
         ax_exec.axis("off")
         ax_exec.text(0.03, 0.5, "Executive assignment data unavailable", color=muted,
                      fontsize=10, transform=ax_exec.transAxes, va="center")
 
-    ax_fr = fig.add_axes([0.075, 0.295, 0.37, 0.19])
+    ax_fr = fig.add_axes([0.12, 0.295, 0.325, 0.19])
     fr = analysis["franchise_summary"].copy()
     # This chart intentionally includes only distinct pending tickets aged strictly more than 2 days.
     # It is separate from the overall backlog count shown in other management KPIs.
@@ -924,18 +1099,14 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     else:
         fr = pd.DataFrame()
     if not fr.empty:
-        # Show complete franchise names by wrapping them onto multiple lines instead of truncating.
-        labels = [textwrap.fill(clean_text(x), width=14, break_long_words=False, break_on_hyphens=False)
-                  for x in fr["Franchise"].astype(str)]
+        labels = [textwrap.fill(clean_text(x), width=22) for x in fr["Franchise"].astype(str)]
         y = np.arange(len(fr))
         aged_over_two = fr["Aged >2 Days"].to_numpy()
         ax_fr.barh(y, aged_over_two, color="#3A78A5", height=0.56)
         ax_fr.set_yticks(y, labels)
         ax_fr.invert_yaxis()
         style_axis(ax_fr, "Franchise calls pending >2 days")
-        ax_fr.tick_params(axis="y", labelsize=7.6, colors=ink, pad=5)
-        for tick_label in ax_fr.get_yticklabels():
-            tick_label.set_multialignment("right")
+        ax_fr.tick_params(axis="y", labelsize=8.2, colors=ink)
         xmax = max(float(aged_over_two.max()), 1)
         ax_fr.set_xlim(0, xmax * 1.18)
         for yy, count in zip(y, aged_over_two):
@@ -957,7 +1128,7 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
         vals = pd.to_numeric(csat_summary["Share %"], errors="coerce").fillna(0).tolist()
         color_map = {"HAPPY": green, "OK": amber, "NOT HAPPY": red}
         bars = ax_feedback.bar(labels, vals, color=[color_map.get(x, "#8A9BA9") for x in labels], width=0.55)
-        style_axis(ax_feedback, "Customer feedback mix")
+        style_axis(ax_feedback, "Customer feedback mix (% of responses)")
         ax_feedback.set_ylim(0, 112)
         ax_feedback.tick_params(axis="x", labelsize=8.4, colors=ink, pad=6)
         ax_feedback.tick_params(axis="y", labelsize=8.0, colors=ink)
@@ -1006,9 +1177,10 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     dq = analysis["data_quality_metrics"]
     dq_text = (
         f"Missing executive: {dq['missing_executive']:,}  ·  Missing technician: {dq['missing_technician']:,}\n"
-        f"Missing ticket ID: {dq['missing_ticket_number']:,}  ·  Extra source rows: {dq['rows_beyond_distinct_tickets']:,}"
+        f"Missing ticket ID: {dq['missing_ticket_number']:,}  ·  Extra source rows: {dq['rows_beyond_distinct_tickets']:,}\n"
+        f"Excluded: {dq['soft_closed_tickets_excluded']:,} soft-closed + {dq['negative_response_tickets_excluded']:,} negative-response ticket(s)"
     )
-    fig.text(0.675, 0.199, dq_text, fontsize=8.2, color=ink, va="top", linespacing=1.45)
+    fig.text(0.675, 0.199, dq_text, fontsize=7.7, color=ink, va="top", linespacing=1.30)
     reg = analysis["registered_count"]
     if reg is not None:
         reg_line = f"Calls registered: {reg:,} distinct tickets ({analysis['registered_date_coverage']})."
@@ -1017,7 +1189,7 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     else:
         reg_line = "Calls registered for selected date: unavailable from uploaded report period."
     reg_line = textwrap.fill(reg_line, width=61)
-    fig.text(0.675, 0.145, reg_line, fontsize=7.9, color=muted, va="top", linespacing=1.35)
+    fig.text(0.675, 0.126, reg_line, fontsize=7.5, color=muted, va="top", linespacing=1.25)
 
     fig.text(0.96, 0.020,
              "INTERNAL WORKING REPORT  ·  Verify source coverage before formal management circulation",
@@ -1082,8 +1254,12 @@ def make_excel(analysis: Dict[str, Any]) -> bytes:
             ("Overdue scheduled calls", analysis["overdue_scheduled"]),
             ("Newly present vs previous snapshot", analysis["movement_counts"]["new"] if analysis["previous_pending_report"] else "N/A"),
             ("No longer listed vs previous snapshot", analysis["movement_counts"]["missing"] if analysis["previous_pending_report"] else "N/A"),
-            ("Happy feedback share", f"{analysis['csat_metrics']['happy_pct']:.2f}%" if analysis["csat_metrics"]["happy_pct"] is not None else "N/A"),
+            ("Customer Satisfaction Score (CSS, exact)", f"{analysis['csat_metrics']['css_pct']:.2f}%" if analysis["csat_metrics"].get("css_pct") is not None else "N/A"),
+            ("Customer Satisfaction Score (rounded for image)", f"{analysis['csat_metrics']['css_pct_rounded']}%" if analysis["csat_metrics"].get("css_pct_rounded") is not None else "N/A"),
+            ("Happy feedback share (feedback mix only)", f"{analysis['csat_metrics']['happy_pct']:.2f}%" if analysis["csat_metrics"]["happy_pct"] is not None else "N/A"),
             ("Not-happy feedback share", f"{analysis['csat_metrics']['not_happy_pct']:.2f}%" if analysis["csat_metrics"]["not_happy_pct"] is not None else "N/A"),
+            ("CSS formula", "(Happy count - Not Happy count) / total nonblank feedback responses × 100"),
+            ("CSS change vs previous CSAT snapshot (percentage points)", f"{analysis['csat_movement']['css_delta_pp']:.2f}" if analysis['csat_movement'].get('css_delta_pp') is not None else "N/A"),
             ("Calls registered on analysis date", analysis["registered_count"] if analysis["registered_count"] is not None else "N/A"),
             ("Records with closure timestamp on date", analysis["closed_count"] if analysis["closed_count"] is not None else "N/A"),
         ]
@@ -1104,8 +1280,9 @@ def make_excel(analysis: Dict[str, Any]) -> bytes:
             overview.set_row(i - 1, 35)
 
         tables: List[Tuple[str, pd.DataFrame]] = []
-        top_cols = [c for c in ["Order", "Ticket No", "Days Old", "Franchise Name", "Customer Name", "Service Executive Name", "Technician Name", "Call Type", "Status", "Missing Executive", "Missing Technician", "Source Row Count", "Spare", "SpareDesc", "Additive", "AdditiveDesc", "Accessories", "AccessoriesDesc"] if c in analysis["priorities"].columns]
+        top_cols = [c for c in ["Order", "Ticket No", "Days Old", "Franchise Name", "Customer Name", "Service Executive Name", "Technician Name", "Call Type", "Status", "Executive % of Top 20", "Missing Executive", "Missing Technician", "Source Row Count", "Spare", "SpareDesc", "Additive", "AdditiveDesc", "Accessories", "AccessoriesDesc"] if c in analysis["top20"].columns]
         tables.append(("20 Oldest Calls", analysis["top20"][top_cols].copy()))
+        tables.append(("Top 20 by Executive", analysis.get("top20_executive_summary", pd.DataFrame()).copy()))
         tables.append(("Current Pending", analysis["priorities"].copy()))
         tables.append(("Snapshot Comparison", analysis["comparison"].copy()))
         tables.append(("Backlog by Franchise", analysis["franchise_summary"].copy()))
