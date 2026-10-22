@@ -250,6 +250,14 @@ def summarize_pending_rows(df: pd.DataFrame) -> pd.DataFrame:
         for col in columns:
             if norm(col) in part_norms:
                 rec[col] = join_values(group[col])
+            elif norm(col) == "daysold":
+                # A ticket can occupy multiple component rows; use its greatest age only.
+                numeric_ages = pd.to_numeric(group[col], errors="coerce").dropna()
+                rec[col] = int(numeric_ages.max()) if not numeric_ages.empty else ""
+            elif norm(col) == "callbookdate":
+                # When Days Old is blank, the oldest valid booking date is the age fallback.
+                parsed_dates = pd.to_datetime(group[col], errors="coerce", format="mixed").dropna()
+                rec[col] = parsed_dates.min() if not parsed_dates.empty else choose_value(group[col])
             else:
                 rec[col] = choose_value(group[col])
         rec[ticket_col] = clean_text(key)
@@ -265,27 +273,6 @@ def _get_value(row: pd.Series, aliases: Sequence[str]) -> str:
             return clean_text(row.get(col, ""))
     return ""
 
-
-def suggested_action(status: str, days_old: int, escalation: str, repeat: bool,
-                     scheduled_overdue: bool, executive: str, technician: str) -> str:
-    """Recommend a follow-up using structured call fields only; no pending-reason dependency."""
-    s = norm(status)
-    esc = norm(escalation)
-    if not executive or not technician:
-        return "Confirm accountable owner and technician assignment"
-    if any(t in esc for t in ["esclevel3", "esclevel4", "snrmangmt", "seniormanagement", "socmedia", "socialmedia"]):
-        return "Review escalation immediately; confirm owner and next update"
-    if "reallocation" in s or "negativeresponse" in s:
-        return "Verify assignment/customer follow-up and record next commitment"
-    if repeat:
-        return "Prioritise follow-up; verify service outcome before closure"
-    if scheduled_overdue:
-        return "Confirm missed schedule and record the next committed date"
-    if days_old >= 15:
-        return "Escalate ageing call; obtain a clear resolution plan"
-    if days_old >= 7:
-        return "Contact assigned team and confirm next action/date"
-    return "Verify current status and next committed action"
 
 def enrich_pending(pending_df: pd.DataFrame, snapshot_dt: pd.Timestamp) -> pd.DataFrame:
     df = pending_df.copy()
@@ -328,23 +315,12 @@ def enrich_pending(pending_df: pd.DataFrame, snapshot_dt: pd.Timestamp) -> pd.Da
     )
     df["Missing Executive"] = df["Service Executive Name"].map(lambda v: not bool(clean_text(v)))
     df["Missing Technician"] = df["Technician Name"].map(lambda v: not bool(clean_text(v)))
-    df["Suggested Next Action"] = [
-        suggested_action(
-            status=clean_text(row.get("Status", "")),
-            days_old=int(row.get("Days Old", 0) or 0),
-            escalation=clean_text(row.get("Escalation Level", "")),
-            repeat=bool(row.get("Is Repeat Call", False)),
-            scheduled_overdue=bool(sched_overdue.loc[idx]),
-            executive=clean_text(row.get("Service Executive Name", "")),
-            technician=clean_text(row.get("Technician Name", "")),
-        )
-        for idx, row in df.iterrows()
-    ]
     df["Snapshot As Of"] = snapshot_dt.strftime("%Y-%m-%d %H:%M")
     df["Scheduled Overdue"] = sched_overdue.astype(bool)
-    # The queue is strictly age-ordered: highest Days Old first. No weighted scoring or colour bands.
-    df = df.sort_values(["Days Old"], ascending=[False], kind="stable").reset_index(drop=True)
-    df.insert(0, "Age Rank", range(1, len(df) + 1))
+    # ONLY sort key: Days Old descending. Equal-age calls preserve their source order.
+    # There is no score, weighting, escalation/repeat/schedule tie-breaker, or colour band.
+    df = df.sort_values(by="Days Old", ascending=False, kind="stable", na_position="last").reset_index(drop=True)
+    df.insert(0, "Order", range(1, len(df) + 1))
     return df
 
 
@@ -591,14 +567,15 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
         _fr["Franchise"] = _fr[franchise_col].map(lambda v: clean_text(v) or "Unspecified")
         franchise_summary = _fr.groupby("Franchise", dropna=False).agg(
             **{"Pending Tickets": ("Ticket No", "count"),
+               "Aged >2 Days": ("Days Old", lambda s: int((pd.to_numeric(s, errors="coerce").fillna(0) > 2).sum())),
                "Aged 7+ Days": ("Days Old", lambda s: int((pd.to_numeric(s, errors="coerce").fillna(0) >= 7).sum())),
                "Escalated Tickets": ("Has Escalation", lambda s: int(s.astype(bool).sum())),
                "Repeat-call Flags": ("Is Repeat Call", lambda s: int(s.astype(bool).sum())),
                "Average Age (days)": ("Days Old", lambda s: round(pd.to_numeric(s, errors="coerce").fillna(0).mean(), 1)),
             }
-        ).reset_index().sort_values(["Aged 7+ Days", "Pending Tickets"], ascending=False).reset_index(drop=True)
+        ).reset_index().sort_values(["Aged >2 Days", "Pending Tickets"], ascending=False).reset_index(drop=True)
     else:
-        franchise_summary = pd.DataFrame(columns=["Franchise", "Pending Tickets", "Aged 7+ Days", "Escalated Tickets", "Repeat-call Flags", "Average Age (days)"])
+        franchise_summary = pd.DataFrame(columns=["Franchise", "Pending Tickets", "Aged >2 Days", "Aged 7+ Days", "Escalated Tickets", "Repeat-call Flags", "Average Age (days)"])
     exec_col = find_col(priorities, ["Service Executive Name"])
     if exec_col:
         _work = priorities.copy()
@@ -674,7 +651,7 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
                 "Timestamp Basis": r["snapshot_source"], "Note": "Source report classified from its column headers.",
             })
     dq_rows += [
-        {"File": "Analysis rule", "Report Type": "Age-based ordering", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Days Old sorted highest to lowest", "Snapshot Used For": "", "Timestamp Basis": "Days Old column; calculated from Call Book Date only when Days Old is blank", "Note": "No weighted priority score, escalation weighting, or priority colour bands. Courtesy Call/Courtesy Visit and Dealer Defective are excluded. Escalation and repeat-call fields are descriptive only."},
+        {"File": "Analysis rule", "Report Type": "Age-only ordering", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Days Old descending; oldest first", "Snapshot Used For": "", "Timestamp Basis": "Days Old column; Call Book Date used only if Days Old is blank", "Note": "The only call-ordering key is age. Equal-age tickets retain source order. Courtesy/Courtesy Visit and Dealer Defective calls are excluded."},
         {"File": "Analysis rule", "Report Type": "Snapshot comparison", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "New / continuing / no longer present / status changed / age increased", "Snapshot Used For": "", "Timestamp Basis": "Ticket-number matching on eligible call types", "Note": "A ticket absent from a later Pending Call export is not automatically labelled closed."},
     ]
 
@@ -752,18 +729,15 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
              fontsize=11, weight="bold", ha="right", color="#303030")
 
     col_def = [
-        ("Age Rank", "Rank", 0.040),
-        ("Ticket No", "Ticket No.", 0.075),
-        ("Days Old", "Days Old", 0.045),
-        ("Customer Name", "Customer", 0.100),
-        ("Franchise Name", "Franchise", 0.105),
-        ("Service Executive Name", "Service Executive", 0.100),
-        ("Technician Name", "Technician", 0.085),
-        ("Call Type", "Call Type", 0.070),
-        ("Escalation Level", "Escalation Level", 0.070),
-        ("Repeat Call Flag", "Repeat?", 0.040),
-        ("Status", "Status", 0.070),
-        ("Suggested Next Action", "Recommended Action", 0.200),
+        ("Order", "No.", 0.035),
+        ("Ticket No", "Ticket No.", 0.085),
+        ("Days Old", "Days Old", 0.055),
+        ("Customer Name", "Customer", 0.125),
+        ("Franchise Name", "Franchise", 0.130),
+        ("Service Executive Name", "Service Executive", 0.130),
+        ("Technician Name", "Technician", 0.110),
+        ("Call Type", "Call Type", 0.105),
+        ("Status", "Status", 0.100),
     ]
     present = [(src, label, width) for src, label, width in col_def if src in data.columns]
     total = sum(c[2] for c in present)
@@ -775,14 +749,12 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
         for src, _, _ in present:
             value = clean_text(row.get(src, ""))
             limit = {
-                "Suggested Next Action": 56,
-                "Franchise Name": 25,
-                "Customer Name": 19,
-                "Service Executive Name": 20,
-                "Technician Name": 18,
-                "Call Type": 15,
-                "Status": 18,
-                "Escalation Level": 20,
+                "Franchise Name": 30,
+                "Customer Name": 26,
+                "Service Executive Name": 27,
+                "Technician Name": 23,
+                "Call Type": 20,
+                "Status": 20,
             }.get(src)
             if limit and len(value) > limit:
                 value = value[:limit - 3] + "..."
@@ -801,7 +773,7 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
     table.auto_set_font_size(False)
     table.set_fontsize(8.2)
 
-    centered = {"Age Rank", "Days Old", "Repeat Call Flag"}
+    centered = {"Order", "Days Old"}
     for (r, c), cell in table.get_celld().items():
         cell.set_edgecolor("#D0D4D8")
         cell.set_linewidth(0.55)
@@ -819,15 +791,12 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
             src = present[c][0]
             if src in centered:
                 cell.get_text().set_ha("center")
-            if src == "Age Rank":
+            if src == "Order":
                 cell.get_text().set_weight("bold")
 
     fig.text(0.018, 0.064,
-             "Sort rule: Days Old, highest to lowest. Escalation and repeat-call information is shown for context only.",
+             "Sorted only by Days Old (highest to lowest). Equal-age calls retain their order in the source report.",
              fontsize=9, color="#4F5963")
-    fig.text(0.982, 0.030,
-             "No weighted scoring or priority colour coding is applied.",
-             fontsize=8, color="#69737D", ha="right")
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -835,16 +804,33 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
 
 
 def make_management_png(analysis: Dict[str, Any]) -> bytes:
+    """Create a high-contrast, one-page management summary with fixed non-overlapping panels."""
     import matplotlib.pyplot as plt
     import numpy as np
+    import textwrap
 
-    navy, teal, amber, red, green, gray = "#12304A", "#148A8A", "#E7A83E", "#C74646", "#2E8B62", "#5D6C7B"
-    fig = plt.figure(figsize=(16, 10), dpi=160, facecolor="#F6F8FA")
-    fig.text(0.04, 0.955, "SERVICE OPERATIONS | DAILY MANAGEMENT BRIEF", fontsize=20, weight="bold", color=navy)
-    fig.text(0.04, 0.925, f"Hyderabad Branch  ·  Report date {_date_label(analysis['analysis_date'])}  ·  {_snapshot_status(analysis)}", fontsize=9.3, color=gray)
+    navy = "#18344D"
+    teal = "#0B7E83"
+    amber = "#C78318"
+    red = "#B9363E"
+    green = "#237A55"
+    ink = "#263746"
+    muted = "#435365"
+    grid = "#E3E8ED"
+    page = "#F3F6F8"
+
+    # A little taller than the earlier version creates more breathing room for labels and notes.
+    fig = plt.figure(figsize=(16, 11), dpi=180, facecolor=page)
+    fig.text(0.04, 0.962, "SERVICE OPERATIONS | DAILY MANAGEMENT BRIEF",
+             fontsize=20, weight="bold", color=navy, va="top")
+    fig.text(0.04, 0.923,
+             f"Hyderabad Branch  ·  Report date {_date_label(analysis['analysis_date'])}  ·  {_snapshot_status(analysis)}",
+             fontsize=10.2, color=muted, va="top")
     snap = analysis["current_pending_report"]["snapshot_dt"]
-    fig.text(0.96, 0.955, f"AS OF {snap.strftime('%d %b %Y %I:%M %p')}", fontsize=9, weight="bold", color=teal, ha="right")
+    fig.text(0.96, 0.962, f"AS OF {snap.strftime('%d %b %Y  %I:%M %p')}",
+             fontsize=9.5, weight="bold", color=teal, ha="right", va="top")
 
+    # KPI tiles have consistent widths, baselines, and padding.
     current = analysis["current_unique_tickets"]
     mc = analysis["movement_counts"]
     happy = analysis["csat_metrics"]["happy_pct"]
@@ -853,137 +839,190 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
         ("AGED 7+ DAYS", f"{analysis['older_7']:,}", amber),
         ("ESCALATED", f"{analysis['escalated']:,}", red),
         ("REPEAT FLAGS", f"{analysis['repeat_calls']:,}", teal),
-        ("NEW IN LATEST SNAPSHOT", f"{mc['new']:,}" if analysis["previous_pending_report"] else "—", "#3478A8"),
+        ("NEW IN LATEST SNAPSHOT", f"{mc['new']:,}" if analysis["previous_pending_report"] else "—", "#2E6D9C"),
         ("HAPPY FEEDBACK", f"{happy:.1f}%" if happy is not None else "—", green),
     ]
-    for i, (label, value, color) in enumerate(kpis):
-        x = 0.04 + i * 0.155
-        box = plt.Rectangle((x, 0.815), 0.142, 0.078, transform=fig.transFigure, facecolor="#FFFFFF", edgecolor="#DDE5EC", linewidth=1.0)
-        fig.patches.append(box)
-        fig.text(x + 0.009, 0.866, label, fontsize=6.9, color=gray, weight="bold")
-        fig.text(x + 0.009, 0.829, value, fontsize=17, color=color, weight="bold")
+    x0, step, card_w = 0.04, 0.155, 0.143
+    for i, (label, value, value_color) in enumerate(kpis):
+        x = x0 + i * step
+        fig.patches.append(plt.Rectangle(
+            (x, 0.817), card_w, 0.078, transform=fig.transFigure,
+            facecolor="#FFFFFF", edgecolor="#D8E0E7", linewidth=1.0, zorder=0
+        ))
+        fig.text(x + 0.010, 0.868, label, fontsize=7.5, color=muted,
+                 weight="bold", va="center")
+        fig.text(x + 0.010, 0.835, value, fontsize=17, color=value_color,
+                 weight="bold", va="center")
 
-    # Layout uses separate axes for compact management charts.
-    ax_age = fig.add_axes([0.055, 0.52, 0.40, 0.22])
+    def style_axis(ax, title, title_size=11.5):
+        ax.set_facecolor("#FFFFFF")
+        ax.set_title(title, loc="left", color=navy, fontsize=title_size,
+                     fontweight="bold", pad=10)
+        ax.tick_params(axis="both", labelsize=8.3, colors=ink, length=0, pad=5)
+        ax.grid(axis="x", color=grid, linewidth=0.75)
+        ax.set_axisbelow(True)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    # Fixed chart grid: axes never intrude into the bottom management notes.
+    ax_age = fig.add_axes([0.075, 0.545, 0.37, 0.205])
     age = analysis["age_summary"].copy()
     if not age.empty:
-        ax_age.barh(age["Age Bucket"].astype(str), age["Unique Tickets"], color=["#A9BCCB", "#8DAFC1", "#6798B0", teal, amber, red][:len(age)])
+        age["Unique Tickets"] = pd.to_numeric(age["Unique Tickets"], errors="coerce").fillna(0)
+        age_colors = ["#A8BAC8", "#8AA9BC", "#648EA8", "#2E8588", "#D39A35", "#B94842"]
+        ax_age.barh(age["Age Bucket"].astype(str), age["Unique Tickets"],
+                    color=age_colors[:len(age)], height=0.62)
         ax_age.invert_yaxis()
-        ax_age.set_title("Pending backlog by age", loc="left", color=navy, fontsize=10, fontweight="bold", pad=8)
-        ax_age.tick_params(axis="y", labelsize=7.2, colors=gray)
-        ax_age.tick_params(axis="x", labelsize=7, colors=gray)
-        ax_age.grid(axis="x", alpha=.18)
-        ax_age.set_axisbelow(True)
-        for spine in ax_age.spines.values(): spine.set_visible(False)
+        style_axis(ax_age, "Pending backlog by age")
+        ax_age.tick_params(axis="y", labelsize=8.6, colors=ink)
+        xmax = max(float(age["Unique Tickets"].max()), 1)
+        ax_age.set_xlim(0, xmax * 1.13)
+        for y, val in enumerate(age["Unique Tickets"].to_numpy()):
+            ax_age.text(val + xmax * 0.015, y, f"{int(val):,}", va="center",
+                        ha="left", fontsize=8.2, color=ink, weight="bold")
+        ax_age.grid(axis="y", visible=False)
     else:
         ax_age.axis("off")
+        ax_age.text(0.03, 0.5, "Ageing data unavailable", color=muted, fontsize=10,
+                    transform=ax_age.transAxes, va="center")
 
-    ax_exec = fig.add_axes([0.55, 0.52, 0.40, 0.22])
-    ex = analysis["executive_summary"].sort_values(["Aged 7+ Days", "Escalated Tickets", "Pending Tickets"], ascending=False).head(6).copy()
+    ax_exec = fig.add_axes([0.575, 0.545, 0.35, 0.205])
+    ex = analysis["executive_summary"].copy()
     if not ex.empty:
-        labels = [textwrap.shorten(clean_text(x), width=25, placeholder="…") for x in ex["Executive"].astype(str)]
+        ex["Pending Tickets"] = pd.to_numeric(ex["Pending Tickets"], errors="coerce").fillna(0)
+        ex["Aged 7+ Days"] = pd.to_numeric(ex["Aged 7+ Days"], errors="coerce").fillna(0)
+        ex = ex.sort_values("Pending Tickets", ascending=False, kind="stable").head(5).copy()
+        labels = [textwrap.shorten(clean_text(x), width=21, placeholder="…") for x in ex["Executive"].astype(str)]
         y = np.arange(len(ex))
-        pending_vals = pd.to_numeric(ex["Pending Tickets"], errors="coerce").fillna(0).to_numpy()
-        aged_vals = pd.to_numeric(ex["Aged 7+ Days"], errors="coerce").fillna(0).to_numpy()
-        height = 0.36
-        ax_exec.barh(y - height / 2, pending_vals, height=height, color="#3478A8", label="All pending")
-        ax_exec.barh(y + height / 2, aged_vals, height=height, color=amber, label="Aged 7+ days")
+        totals = ex["Pending Tickets"].to_numpy()
+        aged = ex["Aged 7+ Days"].to_numpy()
+        ax_exec.barh(y, totals, color="#3A78A5", height=0.56)
         ax_exec.set_yticks(y, labels)
         ax_exec.invert_yaxis()
-        ax_exec.set_title("Executive workload hotspots", loc="left", color=navy, fontsize=10, fontweight="bold", pad=8)
-        ax_exec.tick_params(axis="y", labelsize=6.8, colors=gray)
-        ax_exec.tick_params(axis="x", labelsize=7, colors=gray)
-        ax_exec.grid(axis="x", alpha=.18)
-        ax_exec.legend(frameon=False, fontsize=6.5, loc="lower right")
-        ax_exec.set_axisbelow(True)
-        for spine in ax_exec.spines.values(): spine.set_visible(False)
+        style_axis(ax_exec, "Executive workload")
+        ax_exec.tick_params(axis="y", labelsize=8.1, colors=ink)
+        xmax = max(float(totals.max()), 1)
+        ax_exec.set_xlim(0, xmax * 1.45)
+        for yy, total, aged_v in zip(y, totals, aged):
+            ax_exec.text(total + xmax * 0.025, yy,
+                         f"{int(total):,} total  ·  {int(aged_v):,} aged 7+",
+                         va="center", ha="left", fontsize=7.8, color=ink)
+        ax_exec.grid(axis="y", visible=False)
     else:
         ax_exec.axis("off")
+        ax_exec.text(0.03, 0.5, "Executive assignment data unavailable", color=muted,
+                     fontsize=10, transform=ax_exec.transAxes, va="center")
 
-    ax_fr = fig.add_axes([0.055, 0.205, 0.40, 0.22])
-    fr = analysis["franchise_summary"].head(6).copy()
+    ax_fr = fig.add_axes([0.075, 0.295, 0.37, 0.19])
+    fr = analysis["franchise_summary"].copy()
+    # This chart intentionally includes only distinct pending tickets aged strictly more than 2 days.
+    # It is separate from the overall backlog count shown in other management KPIs.
+    if not fr.empty and "Aged >2 Days" in fr.columns:
+        fr["Aged >2 Days"] = pd.to_numeric(fr["Aged >2 Days"], errors="coerce").fillna(0)
+        fr = fr.loc[fr["Aged >2 Days"] > 0]
+        fr = fr.sort_values("Aged >2 Days", ascending=False, kind="stable").head(5).copy()
+    else:
+        fr = pd.DataFrame()
     if not fr.empty:
-        labels = [textwrap.shorten(clean_text(x), width=22, placeholder="…") for x in fr["Franchise"].astype(str)]
+        labels = [textwrap.shorten(clean_text(x), width=16, placeholder="…") for x in fr["Franchise"].astype(str)]
         y = np.arange(len(fr))
-        total_vals = pd.to_numeric(fr["Pending Tickets"], errors="coerce").fillna(0).to_numpy()
-        aged_vals = pd.to_numeric(fr["Aged 7+ Days"], errors="coerce").fillna(0).to_numpy()
-        height = 0.36
-        ax_fr.barh(y - height / 2, total_vals, height=height, color="#3478A8", label="All pending")
-        ax_fr.barh(y + height / 2, aged_vals, height=height, color=amber, label="Aged 7+ days")
+        aged_over_two = fr["Aged >2 Days"].to_numpy()
+        ax_fr.barh(y, aged_over_two, color="#3A78A5", height=0.56)
         ax_fr.set_yticks(y, labels)
         ax_fr.invert_yaxis()
-        ax_fr.set_title("Franchise bottlenecks", loc="left", color=navy, fontsize=10, fontweight="bold", pad=8)
-        ax_fr.tick_params(axis="y", labelsize=6.8, colors=gray)
-        ax_fr.tick_params(axis="x", labelsize=7, colors=gray)
-        ax_fr.grid(axis="x", alpha=.18)
-        ax_fr.legend(frameon=False, fontsize=6.5, loc="lower right")
-        ax_fr.set_axisbelow(True)
-        for spine in ax_fr.spines.values(): spine.set_visible(False)
+        style_axis(ax_fr, "Franchise calls pending >2 days")
+        ax_fr.tick_params(axis="y", labelsize=8.2, colors=ink)
+        xmax = max(float(aged_over_two.max()), 1)
+        ax_fr.set_xlim(0, xmax * 1.18)
+        for yy, count in zip(y, aged_over_two):
+            ax_fr.text(count + xmax * 0.025, yy, f"{int(count):,}",
+                       va="center", ha="left", fontsize=8.3, color=ink, weight="bold")
+        ax_fr.grid(axis="y", visible=False)
     else:
         ax_fr.axis("off")
+        ax_fr.text(0.03, 0.5, "No franchise calls aged >2 days", color=muted,
+                   fontsize=10, transform=ax_fr.transAxes, va="center")
 
-    ax_feedback = fig.add_axes([0.55, 0.205, 0.40, 0.22])
+    ax_feedback = fig.add_axes([0.575, 0.295, 0.35, 0.19])
     csat_summary = analysis["csat_summary"].copy()
     if not csat_summary.empty:
         order = {"HAPPY": 0, "OK": 1, "NOT HAPPY": 2}
         csat_summary["_ord"] = csat_summary["Feedback"].map(lambda x: order.get(clean_text(x).upper(), 3))
         csat_summary = csat_summary.sort_values("_ord")
-        label = csat_summary["Feedback"].astype(str).str.upper().tolist()
-        vals = csat_summary["Share %"].tolist()
-        colmap = {"HAPPY": green, "OK": amber, "NOT HAPPY": red}
-        colors = [colmap.get(x.upper(), "#AAB6C2") for x in label]
-        bars = ax_feedback.bar(label, vals, color=colors, width=0.55)
-        happy_delta = analysis["csat_movement"].get("happy_delta_pp")
-        feedback_title = "Customer feedback mix · latest available report"
-        if happy_delta is not None:
-            feedback_title += f" · Happy share Δ {happy_delta:+.2f} pp"
-        ax_feedback.set_title(feedback_title, loc="left", color=navy, fontsize=10, fontweight="bold", pad=8)
-        ax_feedback.set_ylim(0, max(100, max(vals, default=0) * 1.15))
-        ax_feedback.tick_params(axis="x", labelsize=7.5, colors=gray)
-        ax_feedback.tick_params(axis="y", labelsize=7, colors=gray)
-        ax_feedback.grid(axis="y", alpha=.18)
-        ax_feedback.set_axisbelow(True)
+        labels = csat_summary["Feedback"].astype(str).str.upper().tolist()
+        vals = pd.to_numeric(csat_summary["Share %"], errors="coerce").fillna(0).tolist()
+        color_map = {"HAPPY": green, "OK": amber, "NOT HAPPY": red}
+        bars = ax_feedback.bar(labels, vals, color=[color_map.get(x, "#8A9BA9") for x in labels], width=0.55)
+        style_axis(ax_feedback, "Customer feedback mix")
+        ax_feedback.set_ylim(0, 112)
+        ax_feedback.tick_params(axis="x", labelsize=8.4, colors=ink, pad=6)
+        ax_feedback.tick_params(axis="y", labelsize=8.0, colors=ink)
+        ax_feedback.grid(axis="x", visible=False)
         for bar, val in zip(bars, vals):
-            ax_feedback.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1.5, f"{val:.1f}%", ha="center", fontsize=7.5, color=navy, weight="bold")
-        for spine in ax_feedback.spines.values(): spine.set_visible(False)
+            ax_feedback.text(bar.get_x() + bar.get_width() / 2, min(bar.get_height() + 2.0, 106),
+                             f"{val:.1f}%", ha="center", va="bottom", fontsize=9,
+                             color=ink, weight="bold")
     else:
         ax_feedback.axis("off")
-        ax_feedback.text(0.05, 0.45, "No Customer Satisfaction report uploaded", transform=ax_feedback.transAxes, color=gray)
+        ax_feedback.text(0.03, 0.5, "No Customer Satisfaction report uploaded",
+                         transform=ax_feedback.transAxes, color=muted, fontsize=10, va="center")
 
-    # Snapshot movement strip with non-closure caveat.
+    # Bounded, two-column insight panel. Explicit wrapping prevents long source data from
+    # running into charts or each other on the exported PNG.
+    fig.patches.append(plt.Rectangle((0.04, 0.045), 0.92, 0.20,
+                                     transform=fig.transFigure, facecolor="#FFFFFF",
+                                     edgecolor="#D8E0E7", linewidth=1.0, zorder=0))
+    fig.text(0.055, 0.222, "SNAPSHOT MOVEMENT", fontsize=9.0, color=teal,
+             weight="bold", va="center")
     prev = analysis["previous_pending_report"]
     if prev:
-        movement_text = (f"Previous snapshot: {prev['snapshot_dt'].strftime('%d %b %Y %I:%M %p')}   |   "
-                         f"Newly present: {mc['new']:,}   |   Continuing: {mc['continuing']:,}   |   "
-                         f"No longer listed: {mc['missing']:,}   |   Status changed: {mc['status_changed']:,}   |   Age increased: {mc['age_increased']:,}")
+        movement_text = (
+            f"Previous: {prev['snapshot_dt'].strftime('%d %b %Y %I:%M %p')}  ·  "
+            f"Newly present: {mc['new']:,}  ·  Continuing: {mc['continuing']:,}\n"
+            f"No longer listed: {mc['missing']:,}  ·  Status changed: {mc['status_changed']:,}  ·  Age increased: {mc['age_increased']:,}"
+        )
     else:
         movement_text = "Only one Pending Call snapshot was uploaded; hourly movement cannot yet be calculated."
-    fig.text(0.04, 0.135, "SNAPSHOT MOVEMENT", fontsize=8, color=teal, weight="bold")
-    fig.text(0.04, 0.112, movement_text, fontsize=7.6, color=navy)
-    fig.text(0.04, 0.082, "Interpretation: 'No longer listed' does not prove closure. Compare with source-system closure status before reporting closures.", fontsize=7.1, color=red)
+    fig.text(0.055, 0.199, movement_text, fontsize=8.4, color=ink,
+             va="top", linespacing=1.45)
+    caveat = "Note: a call no longer listed in a later snapshot is not proof of closure."
+    fig.text(0.055, 0.145, caveat, fontsize=8.1, color=red, va="top")
     status_counts = analysis["status_summary"].head(4)
-    status_line = "Status mix: " + " · ".join(f"{clean_text(r['Status']) or 'Unspecified'} {int(r['Unique Tickets']):,}" for _, r in status_counts.iterrows()) if not status_counts.empty else "Status mix: not available"
-    fig.text(0.04, 0.067, status_line, fontsize=7.0, color=gray)
+    status_line = "Status mix: " + "  ·  ".join(
+        f"{clean_text(row['Status']) or 'Unspecified'} {int(row['Unique Tickets']):,}"
+        for _, row in status_counts.iterrows()
+    ) if not status_counts.empty else "Status mix: not available"
+    fig.text(0.055, 0.118, status_line, fontsize=8.0, color=muted, va="top")
+
+    # Second column for data quality and coverage, separated by a vertical divider.
+    fig.lines.append(plt.Line2D([0.655, 0.655], [0.065, 0.225], transform=fig.transFigure,
+                                color="#E0E6EB", linewidth=1.0))
+    fig.text(0.675, 0.222, "DATA QUALITY & COVERAGE", fontsize=9.0, color=teal,
+             weight="bold", va="center")
     dq = analysis["data_quality_metrics"]
-    dq_text = (f"Data quality: {dq['missing_executive']:,} missing executive · "
-               f"{dq['missing_technician']:,} missing technician · {dq['missing_ticket_number']:,} missing ticket ID · "
-               f"{dq['rows_beyond_distinct_tickets']:,} additional source rows beyond distinct tickets")
-    fig.text(0.04, 0.052, dq_text, fontsize=7.0, color=amber)
+    dq_text = (
+        f"Missing executive: {dq['missing_executive']:,}  ·  Missing technician: {dq['missing_technician']:,}\n"
+        f"Missing ticket ID: {dq['missing_ticket_number']:,}  ·  Extra source rows: {dq['rows_beyond_distinct_tickets']:,}"
+    )
+    fig.text(0.675, 0.199, dq_text, fontsize=8.2, color=ink, va="top", linespacing=1.45)
     reg = analysis["registered_count"]
     if reg is not None:
-        reg_line = f"Calls Registered for {_date_label(analysis['analysis_date'])}: {reg:,} distinct tickets ({analysis['registered_date_coverage']})."
+        reg_line = f"Calls registered: {reg:,} distinct tickets ({analysis['registered_date_coverage']})."
         if analysis["closed_count"] is not None:
-            reg_line += f" Closure timestamps on date: {analysis['closed_count']:,}."
+            reg_line += f" Closure timestamps: {analysis['closed_count']:,}."
     else:
-        reg_line = "Calls Registered count for selected date: not available from the uploaded report period."
-    fig.text(0.04, 0.036, reg_line, fontsize=7.0, color=gray)
-    fig.text(0.96, 0.017, "INTERNAL WORKING REPORT · Prototype metrics; validate rules and source coverage before formal management circulation", ha="right", fontsize=6.8, color="#7A8792")
+        reg_line = "Calls registered for selected date: unavailable from uploaded report period."
+    reg_line = textwrap.fill(reg_line, width=61)
+    fig.text(0.675, 0.145, reg_line, fontsize=7.9, color=muted, va="top", linespacing=1.35)
+
+    fig.text(0.96, 0.020,
+             "INTERNAL WORKING REPORT  ·  Verify source coverage before formal management circulation",
+             ha="right", va="center", fontsize=7.5, color="#435365")
+
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
     plt.close(fig)
     return buf.getvalue()
-
-
 def make_pdf(priority_png: bytes, management_png: bytes) -> bytes:
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.utils import ImageReader
@@ -1050,7 +1089,7 @@ def make_excel(analysis: Dict[str, Any]) -> bytes:
             overview.write(row, 1, val, val_fmt)
         overview.merge_range("D5:F5", "INTERPRETATION NOTES", section_fmt)
         notes = [
-            "Pending calls are ordered by Days Old, highest to lowest. No weighted score or priority colour coding is used.",
+            "The 20-call list is sorted only by Days Old, highest to lowest. Equal-age calls retain their source order.",
             "Repeated ticket rows can reflect multiple component/spare details; ranking consolidates by Ticket No and aggregates those details.",
             "A ticket missing from a later pending export is not automatically labelled closed.",
             "The selected snapshot timestamp is taken from the filename when available; otherwise the date-range label is used and export time is unknown.",
@@ -1061,7 +1100,7 @@ def make_excel(analysis: Dict[str, Any]) -> bytes:
             overview.set_row(i - 1, 35)
 
         tables: List[Tuple[str, pd.DataFrame]] = []
-        top_cols = [c for c in ["Age Rank", "Ticket No", "Days Old", "Franchise Name", "Customer Name", "Service Executive Name", "Technician Name", "Call Type", "Escalation Level", "Scheduled Date", "Status", "Repeat Call Flag", "Suggested Next Action", "Missing Executive", "Missing Technician", "Source Row Count", "Spare", "SpareDesc", "Additive", "AdditiveDesc", "Accessories", "AccessoriesDesc"] if c in analysis["priorities"].columns]
+        top_cols = [c for c in ["Order", "Ticket No", "Days Old", "Franchise Name", "Customer Name", "Service Executive Name", "Technician Name", "Call Type", "Status", "Missing Executive", "Missing Technician", "Source Row Count", "Spare", "SpareDesc", "Additive", "AdditiveDesc", "Accessories", "AccessoriesDesc"] if c in analysis["priorities"].columns]
         tables.append(("20 Oldest Calls", analysis["top20"][top_cols].copy()))
         tables.append(("Current Pending", analysis["priorities"].copy()))
         tables.append(("Snapshot Comparison", analysis["comparison"].copy()))
