@@ -874,21 +874,26 @@ def _snapshot_status(analysis: Dict[str, Any]) -> str:
 
 
 def make_priority_png(analysis: Dict[str, Any]) -> bytes:
-    """Render the 20 oldest pending tickets in a neutral spreadsheet-style layout."""
+    """Render the 20 oldest pending tickets plus an executive-share bar chart."""
     import matplotlib.pyplot as plt
+    import numpy as np
+    import textwrap
 
     data = analysis["top20"].copy().head(20)
     snap = analysis["current_pending_report"]["snapshot_dt"]
-    fig = plt.figure(figsize=(21, 8.6), dpi=160, facecolor="#FFFFFF")
-    ax = fig.add_axes([0.012, 0.105, 0.976, 0.755])
-    ax.axis("off")
-    fig.text(0.018, 0.945, "Pending calls — 20 oldest tickets", fontsize=20, color="#303236")
-    fig.text(0.018, 0.908,
-             f"Hyderabad Service Branch  |  As of {snap.strftime('%d %b %Y, %I:%M %p')}  |  Ordered by call age, oldest first",
-             fontsize=10, color="#5B6570")
-    fig.text(0.982, 0.945, f"{analysis['current_unique_tickets']:,} UNIQUE TICKETS",
-             fontsize=11, weight="bold", ha="right", color="#303030")
+    fig = plt.figure(figsize=(21, 11.2), dpi=160, facecolor="#FFFFFF")
 
+    # Header
+    fig.text(0.018, 0.962, "Pending calls — 20 oldest tickets", fontsize=20, color="#303236", va="top")
+    fig.text(0.018, 0.925,
+             f"Hyderabad Service Branch  |  As of {snap.strftime('%d %b %Y, %I:%M %p')}  |  Ordered by call age, oldest first",
+             fontsize=10, color="#5B6570", va="top")
+    fig.text(0.982, 0.962, f"{analysis['current_unique_tickets']:,} ACTIVE PENDING TICKETS",
+             fontsize=11, weight="bold", ha="right", va="top", color="#303030")
+
+    # Table occupies its own top panel; leave a clear gap for the chart below.
+    ax = fig.add_axes([0.012, 0.305, 0.976, 0.555])
+    ax.axis("off")
     col_def = [
         ("Order", "No.", 0.035),
         ("Ticket No", "Ticket No.", 0.085),
@@ -961,9 +966,53 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
             if src == "Order":
                 cell.get_text().set_weight("bold")
 
-    fig.text(0.018, 0.064,
-             "Sorted only by Days Old, oldest first. Exec. % shows that executive's share of the 20 calls displayed.",
-             fontsize=9, color="#4F5963")
+    # Executive mix chart for only the 20 calls shown in the table. This is descriptive,
+    # not a priority score, and the bar labels show both ticket count and share of Top 20.
+    ex = analysis.get("top20_executive_summary", pd.DataFrame()).copy()
+    if not ex.empty:
+        ex["Top 20 Calls"] = pd.to_numeric(ex["Top 20 Calls"], errors="coerce").fillna(0)
+        ex["Share of Top 20 (%)"] = pd.to_numeric(ex["Share of Top 20 (%)"], errors="coerce").fillna(0)
+        ex["Executive"] = ex["Executive"].map(lambda v: clean_text(v) or "Unspecified")
+        ex = ex.sort_values(["Top 20 Calls", "Executive"], ascending=[False, True], kind="stable").copy()
+        if len(ex) > 6:
+            top = ex.head(5).copy()
+            other = ex.iloc[5:]
+            top = pd.concat([top, pd.DataFrame([{
+                "Executive": "Other executives",
+                "Top 20 Calls": int(other["Top 20 Calls"].sum()),
+                "Share of Top 20 (%)": float(other["Share of Top 20 (%)"].sum()),
+            }])], ignore_index=True)
+            ex = top
+        labels = [textwrap.fill(v, width=26, break_long_words=False) for v in ex["Executive"].astype(str)]
+        y = np.arange(len(ex))
+        counts = ex["Top 20 Calls"].to_numpy(dtype=float)
+        shares = ex["Share of Top 20 (%)"].to_numpy(dtype=float)
+        ax_exec = fig.add_axes([0.19, 0.075, 0.735, 0.155])
+        ax_exec.barh(y, counts, color="#3A78A5", height=0.58)
+        ax_exec.set_yticks(y)
+        ax_exec.set_yticklabels(labels, fontsize=7.8, color="#263746")
+        ax_exec.invert_yaxis()
+        ax_exec.set_title("Top 20 calls by service executive", loc="left", fontsize=10.5,
+                          color="#18344D", fontweight="bold", pad=5)
+        ax_exec.tick_params(axis="x", labelsize=7.5, colors="#435365", length=0, pad=3)
+        ax_exec.tick_params(axis="y", length=0, pad=7)
+        ax_exec.xaxis.grid(True, color="#E3E8ED", linewidth=0.65)
+        ax_exec.set_axisbelow(True)
+        for spine in ax_exec.spines.values():
+            spine.set_visible(False)
+        xmax = max(float(counts.max()), 1.0)
+        ax_exec.set_xlim(0, xmax * 1.36)
+        ax_exec.set_xlabel("Number of calls in Top 20", fontsize=7.5, color="#435365", labelpad=2)
+        for yy, count, share in zip(y, counts, shares):
+            ax_exec.text(count + xmax * 0.025, yy, f"{int(count)} calls  ·  {share:.1f}%",
+                         va="center", ha="left", fontsize=7.6, color="#263746", weight="bold")
+    else:
+        fig.text(0.018, 0.15, "Executive distribution unavailable: no executive names found in the Top 20.",
+                 fontsize=9, color="#435365")
+
+    fig.text(0.018, 0.025,
+             "Sorted only by Days Old, oldest first. Bar chart shows executive share of the 20 calls displayed; no priority score is used.",
+             fontsize=8.7, color="#4F5963", va="bottom")
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
