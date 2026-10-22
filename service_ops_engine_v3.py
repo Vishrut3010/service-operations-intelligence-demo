@@ -111,16 +111,43 @@ def _classify(df: pd.DataFrame) -> str:
     return "unknown"
 
 
+def _dedupe_excel_headers(raw_headers: Sequence[Any]) -> List[str]:
+    """Match pandas' usual duplicate-header naming while reading the workbook once."""
+    names: List[str] = []
+    used: set[str] = set()
+    next_suffix: Dict[str, int] = {}
+    for idx, value in enumerate(raw_headers):
+        base = clean_text(value) or f"Unnamed: {idx}"
+        name = base
+        suffix = next_suffix.get(base, 0)
+        if name in used:
+            suffix = max(suffix, 1)
+            name = f"{base}.{suffix}"
+            while name in used:
+                suffix += 1
+                name = f"{base}.{suffix}"
+        used.add(name)
+        next_suffix[base] = suffix + 1
+        names.append(name)
+    return names
+
+
 def parse_report(filename: str, file_bytes: bytes, upload_order: int = 0) -> Dict[str, Any]:
-    """Read one uploaded workbook and classify it using its headers and metadata."""
-    preview = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None, nrows=15, dtype=object)
+    """Read one Excel workbook once, detect its header and classify the report.
+
+    Previous versions opened every workbook twice (once for the 15-row preview and
+    once for the actual data). Reading the first sheet once reduces upload latency,
+    especially for the 6k-row CSAT exports, without changing the parsed cell values.
+    """
+    sheet = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None, dtype=object)
+    preview = sheet.iloc[:15].copy()
     header_idx = _detect_header(preview)
     if header_idx is None:
         raise ValueError("Could not locate a report header row containing Ticket No and report fields.")
 
     metadata = ""
-    for _, row in preview.iterrows():
-        for cell in row.tolist():
+    for row in preview.itertuples(index=False, name=None):
+        for cell in row:
             val = clean_text(cell)
             if val and "date range" in val.lower():
                 metadata = val
@@ -129,15 +156,14 @@ def parse_report(filename: str, file_bytes: bytes, upload_order: int = 0) -> Dic
             break
     period_start, period_end = _parse_report_range(metadata)
 
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=header_idx, dtype=object)
+    columns = _dedupe_excel_headers(sheet.iloc[header_idx].tolist())
+    df = sheet.iloc[header_idx + 1:].copy()
+    df.columns = columns
     # Remove only fully empty / unnamed filler columns. Keep all meaningful source columns.
-    drop_cols = []
-    for c in df.columns:
-        if clean_text(c).lower().startswith("unnamed") and df[c].isna().all():
-            drop_cols.append(c)
+    drop_cols = [c for c in df.columns
+                 if clean_text(c).lower().startswith("unnamed") and df[c].isna().all()]
     if drop_cols:
         df = df.drop(columns=drop_cols)
-    df.columns = [clean_text(c) if clean_text(c) else f"Column_{i+1}" for i, c in enumerate(df.columns)]
     df = df.dropna(how="all").reset_index(drop=True)
     report_type = _classify(df)
     if report_type == "unknown":
@@ -148,7 +174,6 @@ def parse_report(filename: str, file_bytes: bytes, upload_order: int = 0) -> Dic
         snapshot_dt = filename_dt
         snapshot_source = "timestamp in filename"
     elif period_end is not None:
-        # The report period end is a date label, not necessarily the real export time.
         snapshot_dt = pd.Timestamp(period_end.date()) + pd.Timedelta(hours=23, minutes=59)
         snapshot_source = "date range (export time unknown)"
     else:
@@ -238,35 +263,113 @@ def distinct_ticket_count(df: pd.DataFrame) -> int:
 
 
 def summarize_pending_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """One record per ticket; component/spare fields are consolidated, not discarded."""
+    """Consolidate component rows to one record per ticket using vectorised grouping.
+
+    Normal columns use the most-frequent nonblank value, ties go to the earliest
+    source occurrence. Component columns preserve distinct values in source order;
+    Days Old uses the maximum and Call Book Date uses the earliest valid date.
+    """
     ticket_col = get_ticket_col(df)
-    if not ticket_col:
+    if not ticket_col or df.empty:
         return pd.DataFrame(columns=list(df.columns))
+
     working = df.copy()
     working["__ticket_key"] = working[ticket_col].map(clean_text)
-    working = working[working["__ticket_key"] != ""].copy()
-    part_norms = PART_COLUMNS
+    working = working.loc[working["__ticket_key"].ne("")].copy()
+    if working.empty:
+        return pd.DataFrame(columns=list(df.columns) + ["Source Row Count"])
+
+    keys = working["__ticket_key"]
+    key_order = keys.drop_duplicates().tolist()
+    group_sizes = keys.value_counts(sort=False)
+    # Use the first source row as the base, then replace consolidated columns.
+    result = (working.drop_duplicates("__ticket_key", keep="first")
+                    .set_index("__ticket_key", drop=True)
+                    .reindex(key_order))
     columns = [c for c in working.columns if c != "__ticket_key"]
-    records = []
-    for key, group in working.groupby("__ticket_key", sort=False, dropna=False):
-        rec: Dict[str, Any] = {}
-        for col in columns:
-            if norm(col) in part_norms:
-                rec[col] = join_values(group[col])
-            elif norm(col) == "daysold":
-                # A ticket can occupy multiple component rows; use its greatest age only.
-                numeric_ages = pd.to_numeric(group[col], errors="coerce").dropna()
-                rec[col] = int(numeric_ages.max()) if not numeric_ages.empty else ""
-            elif norm(col) == "callbookdate":
-                # When Days Old is blank, the oldest valid booking date is the age fallback.
-                parsed_dates = pd.to_datetime(group[col], errors="coerce", format="mixed").dropna()
-                rec[col] = parsed_dates.min() if not parsed_dates.empty else choose_value(group[col])
-            else:
-                rec[col] = choose_value(group[col])
-        rec[ticket_col] = clean_text(key)
-        rec["Source Row Count"] = len(group)
-        records.append(rec)
-    return pd.DataFrame(records)
+    part_norms = {norm(c) for c in columns} & PART_COLUMNS
+    part_columns = {c for c in columns if norm(c) in part_norms}
+    days_col = next((c for c in columns if norm(c) == "daysold"), None)
+    book_col = next((c for c in columns if norm(c) == "callbookdate"), None)
+
+    # Consolidate part/additive/accessory descriptions while preserving source order.
+    for col in part_columns:
+        cleaned = working[col].map(clean_text)
+        tmp = pd.DataFrame({"key": keys, "value": cleaned})
+        tmp = tmp[tmp["value"].ne("")]
+        if tmp.empty:
+            result[col] = ""
+        else:
+            # Series are already in source order; dict insertion order preserves it.
+            joined = tmp.groupby("key", sort=False)["value"].agg(
+                lambda values: join_values(values, max_len=300)
+            )
+            result[col] = joined.reindex(key_order).fillna("")
+
+    if days_col:
+        numeric_ages = pd.to_numeric(working[days_col], errors="coerce")
+        max_ages = numeric_ages.groupby(keys, sort=False).max()
+        result[days_col] = max_ages.reindex(key_order)
+        result[days_col] = result[days_col].map(lambda value: int(value) if pd.notna(value) else "")
+
+    if book_col:
+        # Parse each source row once, not once for every ticket group.
+        parsed_dates = pd.to_datetime(working[book_col], errors="coerce", format="mixed")
+        try:
+            parsed_dates = parsed_dates.where(parsed_dates.dt.year > 1900)
+        except Exception:
+            pass
+        earliest = parsed_dates.groupby(keys, sort=False).min().reindex(key_order)
+        # Where no valid date exists, preserve the previous mode/first-seen fallback.
+        cleaned_book = working[book_col].map(clean_text)
+        valid = cleaned_book.ne("")
+        if valid.any():
+            tmp = pd.DataFrame({"key": keys[valid], "value": cleaned_book[valid], "row": range(int(valid.sum()))})
+            mode_book = _first_mode_map(tmp)
+        else:
+            mode_book = {}
+        result[book_col] = [earliest.loc[k] if pd.notna(earliest.loc[k]) else mode_book.get(k, "") for k in key_order]
+
+    # Efficient per-column modes: group value frequencies and stable first occurrence.
+    special = part_columns | {c for c in (days_col, book_col) if c}
+    for col in columns:
+        if col in special or col == ticket_col:
+            continue
+        cleaned = working[col].map(clean_text)
+        nonblank = cleaned.ne("")
+        if not nonblank.any():
+            result[col] = ""
+            continue
+        tmp = pd.DataFrame({"key": keys[nonblank].to_numpy(),
+                            "value": cleaned[nonblank].to_numpy(),
+                            "row": working.index[nonblank].to_numpy()})
+        # Each (ticket, value) pair appears once with count and its first row.
+        stats = tmp.groupby(["key", "value"], sort=False, as_index=False).agg(
+            count=("row", "size"), first=("row", "min")
+        )
+        winners = (stats.sort_values(["key", "count", "first"],
+                                     ascending=[True, False, True], kind="stable")
+                        .drop_duplicates("key", keep="first"))
+        mode_map = dict(zip(winners["key"], winners["value"]))
+        result[col] = [mode_map.get(k, "") for k in key_order]
+
+    result[ticket_col] = key_order
+    result["Source Row Count"] = [int(group_sizes.get(k, 0)) for k in key_order]
+    result = result.reset_index(drop=True)
+    return result[columns + ["Source Row Count"]]
+
+
+def _first_mode_map(tmp: pd.DataFrame) -> Dict[str, str]:
+    """Return most frequent value per key; ties use earliest source row."""
+    if tmp.empty:
+        return {}
+    stats = tmp.groupby(["key", "value"], sort=False, as_index=False).agg(
+        count=("row", "size"), first=("row", "min")
+    )
+    winners = (stats.sort_values(["key", "count", "first"],
+                                 ascending=[True, False, True], kind="stable")
+                    .drop_duplicates("key", keep="first"))
+    return dict(zip(winners["key"], winners["value"]))
 
 
 def _get_value(row: pd.Series, aliases: Sequence[str]) -> str:
@@ -401,6 +504,19 @@ def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str,
     the snapshot timestamp, and tickets whose status is Negative Response from Customer.
     """
     reports = reports or [report]
+    # Cache consolidation/exclusions within one analysis run. Snapshot comparison
+    # asks for current and previous active queues again; don't regroup thousands of
+    # component rows on each call. The key changes when closure reports change.
+    soft_sig = tuple(sorted(
+        (str(r.get("filename", "")), str(r.get("snapshot_dt", "")), int(r.get("rows", 0)))
+        for r in reports if r.get("report_type") == "soft_closure"
+    ))
+    cache_key = (str(report.get("filename", "")), str(report.get("snapshot_dt", "")), soft_sig)
+    cached = report.setdefault("_active_pending_cache", {}).get(cache_key)
+    if cached is not None:
+        cached_grouped, cached_rows, cached_stats = cached
+        return cached_grouped.copy(), cached_rows.copy(), dict(cached_stats)
+
     source_df = report.get("df", pd.DataFrame())
     by_type = filter_pending_call_types(source_df)
     ticket_col = get_ticket_col(by_type)
@@ -432,7 +548,7 @@ def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str,
     source_ticket_ids = by_type[ticket_col].map(clean_text)
     active_source_rows = by_type[source_ticket_ids.isin(active_ids)].copy().reset_index(drop=True)
 
-    return active_grouped, active_source_rows, {
+    stats = {
         "source_distinct_tickets": len(source_ids),
         "active_tickets": len(active_ids),
         "soft_closed_tickets": len(soft_matched),
@@ -442,6 +558,10 @@ def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str,
         "negative_response_ids": negative_only,
         "soft_closed_ids": soft_matched,
     }
+    report.setdefault("_active_pending_cache", {})[cache_key] = (
+        active_grouped.copy(), active_source_rows.copy(), dict(stats)
+    )
+    return active_grouped, active_source_rows, stats
 
 
 def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, Any],
@@ -871,7 +991,10 @@ def _filter_to_scope(df: pd.DataFrame, scope_mode: str, selection: str) -> Tuple
     column, returns an empty frame so branch-wide values are never mislabelled as scoped.
     """
     if scope_mode == "branch":
-        return df.copy(), True
+        # Callers treat source frames as read-only; avoid deep-copying thousands of
+        # CSAT rows on every view render. A branch-scoped priorities frame is copied
+        # by scope_analysis before it is modified.
+        return df, True
     aliases = ( ["Franchise Name", "FrName", "Franchise"] if scope_mode == "franchise"
                 else ["Service Executive Name", "Branch Exe Name", "Branch Executive Name", "Executive Name"] )
     col = find_col(df, aliases)
@@ -995,24 +1118,47 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
     scoped["top20_franchise_summary"] = fr_top_summary
     scoped["top20_status_summary"] = st_top_summary
 
-    # Reconcile source-row counts and exclusions for the current selection.
+    # Reconcile source-row counts and exclusions for the selected scope without
+    # re-running the expensive full-ticket consolidation on every dropdown rerun.
+    # The branch analysis already contains the active, one-row-per-ticket queue.
     current = analysis["current_pending_report"]
     all_reports = analysis.get("reports", [])
-    active_grouped, active_rows, active_stats = active_pending_data(current, all_reports)
-    active_rows_scoped, _ = _filter_to_scope(active_rows, mode, selection)
-    scoped["current_pending_rows"] = len(active_rows_scoped)
-    scoped["current_unique_tickets"] = len(priorities)
-
     filtered_source = filter_pending_call_types(current.get("df", pd.DataFrame()))
     filtered_source_scoped, scope_col_supported = _filter_to_scope(filtered_source, mode, selection)
     ticket_col = get_ticket_col(filtered_source_scoped)
-    source_ids = {clean_text(v) for v in filtered_source_scoped[ticket_col].tolist() if clean_text(v)} if ticket_col else set()
+    source_ids = (
+        {clean_text(v) for v in filtered_source_scoped[ticket_col].tolist() if clean_text(v)}
+        if ticket_col else set()
+    )
     scoped["current_source_distinct_tickets"] = len(source_ids)
     active_ids = set(priorities["Ticket No"].map(clean_text)) if "Ticket No" in priorities.columns else set()
-    soft_ids = set(active_stats.get("soft_closed_ids", set())) & source_ids
-    negative_ids = set(active_stats.get("negative_response_ids", set())) & source_ids
+
+    # Count source rows belonging to currently active tickets; do not call
+    # active_pending_data() again here (it re-groups every component row and can
+    # cause timeouts when executives/franchises are switched).
+    if ticket_col:
+        scoped_ticket_keys = filtered_source_scoped[ticket_col].map(clean_text)
+        active_rows_scoped = filtered_source_scoped.loc[scoped_ticket_keys.isin(active_ids)].copy()
+    else:
+        active_rows_scoped = filtered_source_scoped.iloc[0:0].copy()
+    scoped["current_pending_rows"] = len(active_rows_scoped)
+    scoped["current_unique_tickets"] = len(priorities)
+
+    # Determine excluded ticket counts cheaply for this scope, keeping soft-closed
+    # and negative-response counts mutually exclusive as in active_pending_data().
+    negative_ids = set()
+    status_col_raw = find_col(filtered_source_scoped, ["Status"])
+    if ticket_col and status_col_raw:
+        negative_rows = filtered_source_scoped[
+            filtered_source_scoped[status_col_raw].map(lambda v: "negativeresponse" in norm(v))
+        ]
+        negative_ids = {clean_text(v) for v in negative_rows[ticket_col].tolist() if clean_text(v)}
+    snapshot_dt = pd.Timestamp(current.get("snapshot_dt"))
+    soft_source_ids = soft_closure_ticket_ids_as_of(all_reports, snapshot_dt) & source_ids
+    soft_ids = soft_source_ids - active_ids
+    negative_only = (negative_ids - active_ids) - soft_ids
     scoped["soft_closed_tickets_excluded"] = len(soft_ids)
-    scoped["negative_response_tickets_excluded"] = len(negative_ids - soft_ids)
+    scoped["negative_response_tickets_excluded"] = len(negative_only)
     scoped["prior_unique_tickets"] = None
 
     # Scope comparison movement: count new/continuing from the current scope and missing from the previous scope.

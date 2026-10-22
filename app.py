@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 from pathlib import Path
 
 import pandas as pd
@@ -16,7 +17,7 @@ APP_TITLE = "Service Operations Intelligence"
 st.set_page_config(
     page_title=APP_TITLE,
     page_icon="📊",
-    layout="centered",
+    layout="wide",
     initial_sidebar_state="collapsed",
 )
 
@@ -46,7 +47,7 @@ st.markdown(
         background: linear-gradient(160deg, #FAFAFA 0%, #F4F6F7 60%, #F9F9F8 100%);
       }
       [data-testid="stMain"] .block-container {
-        max-width: 850px;
+        max-width: 1450px;
         padding-top: 1.65rem;
         padding-bottom: 2.2rem;
       }
@@ -254,32 +255,80 @@ st.markdown(
         background: #4E9A70;
         box-shadow: 0 0 0 4px rgba(78,154,112,.12);
       }
-      [data-testid="stTabs"] [data-baseweb="tab-list"] {
-        gap: 8px;
-        border-bottom: 1px solid #D9E0E5;
+      /* Tab-style radio navigation: always visible, high contrast, and responsive. */
+      div[data-testid="stRadio"] div[role="radiogroup"] {
+        display: flex !important;
+        flex-wrap: nowrap !important;
+        align-items: stretch !important;
+        gap: 10px !important;
+        width: 100% !important;
+        padding: 7px !important;
+        margin: 6px 0 14px 0 !important;
+        background: #E9EDF0 !important;
+        border: 1px solid #D2DAE0 !important;
+        border-radius: 14px !important;
       }
-      [data-testid="stTabs"] button[role="tab"] {
-        color: #46525B !important;
-        font-family: var(--body-sans) !important;
-        font-weight: 750 !important;
-        border-radius: 9px 9px 0 0;
-        padding: 10px 14px;
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] {
+        flex: 1 1 0 !important;
+        display: flex !important;
+        justify-content: center !important;
+        align-items: center !important;
+        min-height: 46px !important;
+        padding: 9px 14px !important;
+        margin: 0 !important;
+        background: #FFFFFF !important;
+        border: 1px solid #CFD7DE !important;
+        border-radius: 10px !important;
+        color: #20384B !important;
+        opacity: 1 !important;
+        cursor: pointer !important;
       }
-      [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
-        color: #C93642 !important;
-        border-bottom: 3px solid #C93642 !important;
-        background: rgba(201,54,66,.045) !important;
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] p,
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] span,
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] div {
+        color: inherit !important;
+        -webkit-text-fill-color: inherit !important;
+        opacity: 1 !important;
+        font-weight: 800 !important;
+      }
+      /* Hide the small radio glyph so the choices read as tabs, while keeping them keyboard-accessible. */
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] > div:first-child {
+        display: none !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) {
+        background: #253846 !important;
+        border-color: #253846 !important;
+        color: #FFFFFF !important;
+        box-shadow: 0 3px 9px rgba(37,56,70,.16) !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) p,
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) span,
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) div {
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:hover:not(:has(input:checked)) {
+        background: #FFF1F2 !important;
+        border-color: #C93642 !important;
+        color: #A82732 !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] input:focus-visible + div {
+        outline: 2px solid #C93642 !important;
+        outline-offset: 2px !important;
       }
       [data-testid="stSelectbox"] label {
         color: #253846 !important;
         font-weight: 750 !important;
       }
-      @media (max-width: 560px) {
+      @media (max-width: 760px) {
         [data-testid="stMain"] .block-container { padding-left: 1rem; padding-right: 1rem; }
         .hero { padding: 20px 16px; gap: 13px; min-height: 126px; }
         .brand-logo { width: 105px; }
         .hero h1 { font-size: 22px; }
         .hero p { font-size: 12px; }
+        div[data-testid="stRadio"] div[role="radiogroup"] { gap: 5px !important; padding: 5px !important; }
+        div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] { padding: 8px 5px !important; min-height: 42px !important; }
+        div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] p { font-size: 11px !important; }
       }
     </style>
     <div class="hero">
@@ -312,7 +361,7 @@ uploaded = st.file_uploader(
 
 def read_csv_report(filename: str, data: bytes, order: int) -> dict:
     df = pd.read_csv(io.BytesIO(data), dtype=object)
-    from service_ops_engine import _classify
+    from service_ops_engine_v3 import _classify
 
     report_type = _classify(df)
     if report_type == "unknown":
@@ -348,19 +397,98 @@ def parse_uploaded_files(files) -> tuple[list[dict], list[str]]:
         except Exception as exc:
             errors.append(f"{file.name}: {exc}")
     return reports, errors
+@st.cache_data(show_spinner=False, max_entries=4)
+def cached_load_and_analyze(file_items: tuple[tuple[str, bytes], ...]):
+    """Parse and analyse a particular set of uploaded files once per content hash.
+
+    Streamlit reruns the script when a tab selector or dropdown changes. Caching this
+    expensive step prevents the whole multi-thousand-row workbook from being reconciled
+    again for every selected executive or franchise.
+    """
+    reports: list[dict] = []
+    errors: list[str] = []
+    for idx, (filename, raw) in enumerate(file_items):
+        try:
+            if filename.lower().endswith(".csv"):
+                parsed = read_csv_report(filename, raw, idx)
+            else:
+                parsed = parse_report(filename, raw, idx)
+            reports.append(parsed)
+        except Exception as exc:
+            errors.append(f"{filename}: {type(exc).__name__}: {exc}")
+
+    pending_reports = [r for r in reports if r["report_type"] == "pending_calls"]
+    if reports and pending_reports:
+        latest_report = max(pending_reports, key=lambda r: (r["snapshot_dt"], r["upload_order"]))
+        analysis_date = latest_report["snapshot_dt"].date()
+        try:
+            base_analysis = analyze_reports(reports, analysis_date)
+            status_message = ""
+        except Exception as exc:
+            base_analysis = None
+            status_message = (
+                "Could not analyse the reports. Check the uploaded file formats and try again. "
+                f"Details: {type(exc).__name__}: {exc}"
+            )
+    elif reports:
+        base_analysis = None
+        status_message = (
+            "Files were uploaded, but no Pending Calls report was detected. Please include a Pending Calls report; "
+            "Soft Closure and Customer Satisfaction files are supporting reports."
+        )
+    elif errors:
+        base_analysis = None
+        status_message = "None of the uploaded files could be read. Check the file formats and try again."
+    else:
+        base_analysis = None
+        status_message = "Upload at least one Pending Calls report above to populate these views."
+    return reports, errors, base_analysis, status_message
+
+
 def safe_filename(value: str) -> str:
     import re
     text = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value)).strip("_")
     return text[:70] or "selected"
 
 
+def get_scoped_analysis(base_analysis: dict, scope_mode: str, selection: str = "") -> dict:
+    """Memoize scoped analysis within this browser session for faster tab switching."""
+    fingerprint = st.session_state.get("_upload_fingerprint", "no_upload")
+    cache = st.session_state.setdefault("_scoped_analysis_cache", {})
+    key = (fingerprint, scope_mode, selection)
+    if key in cache:
+        return cache[key]
+    result = scope_analysis(base_analysis, scope_mode, selection)
+    cache[key] = result
+    # Bound session memory when executives move through many franchises.
+    while len(cache) > 18:
+        cache.pop(next(iter(cache)))
+    return result
+
+
 def render_outputs(view_analysis: dict, view_key: str, name_suffix: str = "") -> None:
     if view_analysis["current_unique_tickets"] <= 0:
         st.info("No active pending calls match this selection. Try another franchise or executive.")
         return
+
+    # Images are expensive to draw and don't change when the user revisits the same
+    # uploaded dataset + view + selection. Keep a small session cache so view switching
+    # and repeated downloads don't regenerate both charts every time.
+    upload_fingerprint = st.session_state.get("_upload_fingerprint", "no_upload")
+    image_cache_key = (upload_fingerprint, view_key, name_suffix,
+                       str(view_analysis.get("analysis_date", "")),
+                       int(view_analysis.get("current_unique_tickets", 0)))
+    image_cache = st.session_state.setdefault("_report_png_cache", {})
     try:
-        priority_png = make_priority_png(view_analysis)
-        management_png = make_management_png(view_analysis)
+        if image_cache_key in image_cache:
+            priority_png, management_png = image_cache[image_cache_key]
+        else:
+            priority_png = make_priority_png(view_analysis)
+            management_png = make_management_png(view_analysis)
+            image_cache[image_cache_key] = (priority_png, management_png)
+            # Avoid unbounded growth if many executives/franchises are selected.
+            while len(image_cache) > 12:
+                image_cache.pop(next(iter(image_cache)))
     except Exception as exc:
         st.error(f"Could not generate this view. Details: {exc}")
         return
@@ -391,87 +519,106 @@ def render_outputs(view_analysis: dict, view_key: str, name_suffix: str = "") ->
         )
 
 
+
+# Show a persistent tab-style single-view selector. Rendering only the selected mode
+# avoids expensive hidden-view calculations and prevents cross-view element collisions.
+reports: list[dict] = []
+errors: list[str] = []
+base_analysis = None
+status_message = "Upload at least one Pending Calls report above to populate these views. Supporting Soft Closure and Customer Satisfaction reports can be uploaded alongside it."
+
 if uploaded:
-    reports, errors = parse_uploaded_files(uploaded)
+    # Cache the full parse + analysis by uploaded file content. This is important because
+    # Streamlit reruns on selector changes; analysis must not rerun for every view click.
+    file_items = tuple((file.name, file.getvalue()) for file in uploaded)
+    # Small content fingerprint also keys generated-image caching. Hash each file once
+    # per Streamlit rerun to ensure new uploads never reuse stale images.
+    digest = hashlib.sha256()
+    for filename, raw in file_items:
+        digest.update(filename.encode("utf-8", errors="replace"))
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(hashlib.sha256(raw).digest())
+    st.session_state["_upload_fingerprint"] = digest.hexdigest()
+    with st.spinner("Checking reports…"):
+        reports, errors, base_analysis, status_message = cached_load_and_analyze(file_items)
 
     if errors:
         with st.expander("Some files could not be read"):
             for issue in errors:
                 st.write(f"- {issue}")
 
-    pending_reports = [r for r in reports if r["report_type"] == "pending_calls"]
-    if reports and pending_reports:
-        latest_report = max(
-            pending_reports,
-            key=lambda r: (r["snapshot_dt"], r["upload_order"]),
-        )
-        analysis_date = latest_report["snapshot_dt"].date()
+view_choice = st.radio(
+    "Report view",
+    ["Branch-wise", "Franchise-wise", "Executive-wise"],
+    horizontal=True,
+    key="report_view_choice",
+    label_visibility="collapsed",
+)
 
-        try:
-            with st.spinner("Analysing uploaded reports…"):
-                base_analysis = analyze_reports(reports, analysis_date)
-        except Exception as exc:
-            st.error(f"Could not analyse the reports. Check the uploaded file formats and try again. Details: {exc}")
-            st.stop()
+if view_choice == "Branch-wise":
+    st.caption("Branch-level view · Active pending calls ordered only by Days Old, oldest first.")
+    if base_analysis is None:
+        st.info(status_message)
+    else:
+        render_outputs(get_scoped_analysis(base_analysis, "branch"), "branch")
 
+elif view_choice == "Franchise-wise":
+    st.caption("Select one franchise to generate a shareable update for its franchise group.")
+    if base_analysis is None:
+        st.info(status_message)
+    else:
         active_queue = base_analysis["priorities"]
         franchise_col = "Franchise Name" if "Franchise Name" in active_queue.columns else None
-        executive_col = "Service Executive Name" if "Service Executive Name" in active_queue.columns else None
         franchise_options = sorted(
-            {str(v).strip() for v in active_queue[franchise_col].tolist() if str(v).strip() and str(v).strip().lower() not in {"nan", "none"}},
+            {str(v).strip() for v in active_queue[franchise_col].tolist()
+             if str(v).strip() and str(v).strip().lower() not in {"nan", "none"}},
             key=str.casefold,
         ) if franchise_col else []
+        if not franchise_options:
+            st.warning("No franchise names were found in the active pending-call report.")
+        else:
+            selected_franchise = st.selectbox(
+                "Select franchise", franchise_options, key="selected_franchise", label_visibility="visible"
+            )
+            try:
+                franchise_analysis = get_scoped_analysis(base_analysis, "franchise", selected_franchise)
+                st.caption(
+                    f"{franchise_analysis['current_unique_tickets']:,} active pending tickets · "
+                    f"{franchise_analysis['scope_summary']['aged_over_2']:,} aged over 2 days · "
+                    f"{franchise_analysis['scope_summary']['aged_7_plus']:,} aged 7+ days"
+                )
+                render_outputs(franchise_analysis, "franchise", safe_filename(selected_franchise))
+            except Exception as exc:
+                st.error(f"Could not generate the selected franchise view ({type(exc).__name__}). Try clearing/re-uploading the source reports, or check the app logs for details.")
+
+else:
+    st.caption("Select your name to generate a personal view across all franchises assigned to you.")
+    if base_analysis is None:
+        st.info(status_message)
+    else:
+        active_queue = base_analysis["priorities"]
+        executive_col = "Service Executive Name" if "Service Executive Name" in active_queue.columns else None
         executive_options = sorted(
-            {str(v).strip() for v in active_queue[executive_col].tolist() if str(v).strip() and str(v).strip().lower() not in {"nan", "none"}},
+            {str(v).strip() for v in active_queue[executive_col].tolist()
+             if str(v).strip() and str(v).strip().lower() not in {"nan", "none"}},
             key=str.casefold,
         ) if executive_col else []
-
-        branch_tab, franchise_tab, executive_tab = st.tabs(["Branch-wide", "Franchise-wise", "Executive-wise"])
-
-        with branch_tab:
-            st.caption("All eligible active pending tickets for the branch. Calls are ordered only by Days Old, oldest first.")
-            render_outputs(scope_analysis(base_analysis, "branch"), "branch")
-
-        with franchise_tab:
-            st.caption("Select one franchise to generate a shareable update for its franchise group.")
-            if not franchise_options:
-                st.warning("No franchise names were found in the active pending-call report.")
-            else:
-                selected_franchise = st.selectbox(
-                    "Select franchise", franchise_options, key="selected_franchise", label_visibility="visible"
+        if not executive_options:
+            st.warning("No service executive names were found in the active pending-call report.")
+        else:
+            selected_executive = st.selectbox(
+                "Select service executive", executive_options, key="selected_executive", label_visibility="visible"
+            )
+            try:
+                executive_analysis = get_scoped_analysis(base_analysis, "executive", selected_executive)
+                exec_franchises = executive_analysis["franchise_summary"]
+                franchise_count = int(exec_franchises["Franchise"].nunique()) if not exec_franchises.empty and "Franchise" in exec_franchises.columns else 0
+                st.caption(
+                    f"{executive_analysis['current_unique_tickets']:,} active pending tickets across "
+                    f"{franchise_count:,} franchise(s) · "
+                    f"{executive_analysis['scope_summary']['aged_7_plus']:,} aged 7+ days"
                 )
-                try:
-                    franchise_analysis = scope_analysis(base_analysis, "franchise", selected_franchise)
-                    st.caption(
-                        f"{franchise_analysis['current_unique_tickets']:,} active pending tickets · "
-                        f"{franchise_analysis['scope_summary']['aged_over_2']:,} aged over 2 days · "
-                        f"{franchise_analysis['scope_summary']['aged_7_plus']:,} aged 7+ days"
-                    )
-                    render_outputs(franchise_analysis, "franchise", safe_filename(selected_franchise))
-                except Exception as exc:
-                    st.error(f"Could not generate the selected franchise view. Details: {exc}")
+                render_outputs(executive_analysis, "executive", safe_filename(selected_executive))
+            except Exception as exc:
+                st.error(f"Could not generate the selected executive view ({type(exc).__name__}). Try a different selection or check the app logs for details.")
 
-        with executive_tab:
-            st.caption("Select your name to generate a personal view across all franchises assigned to you.")
-            if not executive_options:
-                st.warning("No service executive names were found in the active pending-call report.")
-            else:
-                selected_executive = st.selectbox(
-                    "Select service executive", executive_options, key="selected_executive", label_visibility="visible"
-                )
-                try:
-                    executive_analysis = scope_analysis(base_analysis, "executive", selected_executive)
-                    exec_franchises = executive_analysis["franchise_summary"]
-                    franchise_count = int(exec_franchises["Franchise"].nunique()) if not exec_franchises.empty and "Franchise" in exec_franchises.columns else 0
-                    st.caption(
-                        f"{executive_analysis['current_unique_tickets']:,} active pending tickets across "
-                        f"{franchise_count:,} franchise(s) · "
-                        f"{executive_analysis['scope_summary']['aged_7_plus']:,} aged 7+ days"
-                    )
-                    render_outputs(executive_analysis, "executive", safe_filename(selected_executive))
-                except Exception as exc:
-                    st.error(f"Could not generate the selected executive view. Details: {exc}")
-    elif reports:
-        st.warning("Please include at least one Pending Calls report. Supporting Soft Closure and Customer Satisfaction reports can be uploaded with it.")
-    elif not errors:
-        st.info("No supported report format was detected. Please check the uploaded files.")
