@@ -200,6 +200,39 @@ st.markdown(
         background: linear-gradient(135deg, #45484B, #292D30);
         color: white;
       }
+      /* High-contrast upload/status alerts: pale yellow background, dark readable text. */
+      [data-testid="stAlert"],
+      div.stAlert,
+      [role="alert"] {
+        background: #FFF7D6 !important;
+        border: 1px solid #D7A52A !important;
+        border-left: 5px solid #9A6700 !important;
+        border-radius: 11px !important;
+        color: #25292D !important;
+        box-shadow: none !important;
+      }
+      [data-testid="stAlert"] *,
+      div.stAlert *,
+      [role="alert"] * {
+        color: #25292D !important;
+        -webkit-text-fill-color: #25292D !important;
+        text-shadow: none !important;
+        opacity: 1 !important;
+      }
+      [data-testid="stAlert"] svg,
+      div.stAlert svg,
+      [role="alert"] svg {
+        color: #8A5A00 !important;
+        fill: #8A5A00 !important;
+      }
+      /* Keep text explaining uploader limits/help readable against the dropzone. */
+      div[data-testid="stFileUploader"] small,
+      div[data-testid="stFileUploader"] [data-testid="stMarkdownContainer"],
+      div[data-testid="stFileUploader"] [data-testid="stMarkdownContainer"] p {
+        color: #3A4248 !important;
+        -webkit-text-fill-color: #3A4248 !important;
+        opacity: 1 !important;
+      }
       .ready-line {
         display: flex;
         align-items: center;
