@@ -455,7 +455,6 @@ def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, A
     cur_map = {}
     age_col_cur = find_col(cur_grouped, ["Days Old"])
     exec_col_cur = find_col(cur_grouped, ["Service Executive Name"])
-    franchise_col_cur = find_col(cur_grouped, ["Franchise Name", "Franchise"])
     status_col_cur = find_col(cur_grouped, ["Status"])
     for _, r in cur_grouped.iterrows():
         key = clean_text(r.get(cur_ticket, ""))
@@ -465,7 +464,6 @@ def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, A
             "status": clean_text(r.get(status_col_cur, "")) if status_col_cur else "",
             "age": pd.to_numeric(pd.Series([r.get(age_col_cur, 0)]), errors="coerce").fillna(0).iloc[0] if age_col_cur else 0,
             "executive": clean_text(r.get(exec_col_cur, "")) if exec_col_cur else "",
-            "franchise": clean_text(r.get(franchise_col_cur, "")) if franchise_col_cur else "",
         }
 
     prev_map = {}
@@ -474,7 +472,6 @@ def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, A
         prev_tcol = get_ticket_col(prev_grouped)
         age_col_prev = find_col(prev_grouped, ["Days Old"])
         exec_col_prev = find_col(prev_grouped, ["Service Executive Name"])
-        franchise_col_prev = find_col(prev_grouped, ["Franchise Name", "Franchise"])
         status_col_prev = find_col(prev_grouped, ["Status"])
         for _, r in prev_grouped.iterrows():
             key = clean_text(r.get(prev_tcol, ""))
@@ -484,7 +481,6 @@ def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, A
                 "status": clean_text(r.get(status_col_prev, "")) if status_col_prev else "",
                 "age": pd.to_numeric(pd.Series([r.get(age_col_prev, 0)]), errors="coerce").fillna(0).iloc[0] if age_col_prev else 0,
                 "executive": clean_text(r.get(exec_col_prev, "")) if exec_col_prev else "",
-                "franchise": clean_text(r.get(franchise_col_prev, "")) if franchise_col_prev else "",
             }
 
     prev_ids, cur_ids = set(prev_map), set(cur_map)
@@ -519,8 +515,6 @@ def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, A
             "Current Days Old": cur_item["age"] if cur_item else "",
             "Previous Executive": prev_item["executive"] if prev_item else "",
             "Current Executive": cur_item["executive"] if cur_item else "",
-            "Previous Franchise": prev_item["franchise"] if prev_item else "",
-            "Current Franchise": cur_item["franchise"] if cur_item else "",
         })
     counts = {
         "new": len(cur_ids - prev_ids),
@@ -864,309 +858,6 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
     }
 
 
-def _filter_to_scope(df: pd.DataFrame, scope_mode: str, selection: str) -> Tuple[pd.DataFrame, bool]:
-    """Filter a source frame to a selected franchise or service executive.
-
-    Returns (filtered_frame, key_supported). If the source does not have the matching
-    column, returns an empty frame so branch-wide values are never mislabelled as scoped.
-    """
-    if scope_mode == "branch":
-        return df.copy(), True
-    aliases = ( ["Franchise Name", "FrName", "Franchise"] if scope_mode == "franchise"
-                else ["Service Executive Name", "Branch Exe Name", "Branch Executive Name", "Executive Name"] )
-    col = find_col(df, aliases)
-    if col is None:
-        return df.iloc[0:0].copy(), False
-    target = norm(selection)
-    return df.loc[df[col].map(norm) == target].copy(), True
-
-
-def _feedback_outputs(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    feedback_col = find_col(df, ["FeedBack", "Feedback", "Feedback Score"]) if not df.empty else None
-    summary = pd.DataFrame(columns=["Feedback", "Count", "Share %"])
-    metrics = {"total": 0, "source_rows": len(df), "blank": 0, "happy": 0, "ok": 0,
-               "not_happy": 0, "happy_pct": None, "not_happy_pct": None,
-               "css_pct": None, "css_pct_rounded": None}
-    if feedback_col is None:
-        return summary, metrics
-    feedback = df[feedback_col].map(lambda v: clean_text(v).upper())
-    valid = feedback[feedback != ""]
-    total = len(valid)
-    counts = valid.value_counts()
-    summary = pd.DataFrame([
-        {"Feedback": label, "Count": int(count), "Share %": round(100 * int(count) / total, 2) if total else 0}
-        for label, count in counts.items()
-    ])
-    happy = int((valid == "HAPPY").sum())
-    ok = int((valid == "OK").sum())
-    not_happy = int((valid == "NOT HAPPY").sum())
-    css = 100 * (happy - not_happy) / total if total else None
-    metrics = {
-        "total": total, "source_rows": len(df), "blank": int((feedback == "").sum()),
-        "happy": happy, "ok": ok, "not_happy": not_happy,
-        "happy_pct": round(100 * happy / total, 2) if total else None,
-        "not_happy_pct": round(100 * not_happy / total, 2) if total else None,
-        "css_pct": round(css, 2) if css is not None else None,
-        "css_pct_rounded": int(round(css)) if css is not None else None,
-    }
-    return summary, metrics
-
-
-def _simple_counts(df: pd.DataFrame, source_col_aliases: Sequence[str], output_col: str) -> pd.DataFrame:
-    col = find_col(df, source_col_aliases) if not df.empty else None
-    if col is None:
-        return pd.DataFrame(columns=[output_col, "Unique Tickets"])
-    vals = df[col].map(lambda v: clean_text(v) or "Unspecified")
-    return vals.value_counts().rename_axis(output_col).reset_index(name="Unique Tickets")
-
-
-def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selection: str = "") -> Dict[str, Any]:
-    """Return a view-specific analysis while preserving age-only ordering.
-
-    scope_mode is one of branch, franchise, executive. Scoped CSAT and registered-call
-    figures are calculated only when those source reports contain a matching scope field.
-    """
-    mode = (scope_mode or "branch").strip().lower()
-    if mode not in {"branch", "franchise", "executive"}:
-        mode = "branch"
-    if mode != "branch" and not clean_text(selection):
-        raise ValueError("Choose a franchise or service executive for this view.")
-
-    scoped = dict(analysis)
-    scoped["scope_mode"] = mode
-    scoped["scope_selection"] = clean_text(selection)
-    scoped["scope_label"] = (
-        "Hyderabad Branch" if mode == "branch" else
-        f"Franchise: {clean_text(selection)}" if mode == "franchise" else
-        f"Service Executive: {clean_text(selection)}"
-    )
-
-    all_priorities = analysis["priorities"].copy()
-    priorities, _ = _filter_to_scope(all_priorities, mode, selection)
-    # Age is the only sort key in every view. Stable sorting keeps source order for ties.
-    priorities["Days Old"] = pd.to_numeric(priorities.get("Days Old", pd.Series(index=priorities.index, dtype=float)), errors="coerce").fillna(0).astype(int)
-    priorities = priorities.sort_values("Days Old", ascending=False, kind="stable").reset_index(drop=True)
-    if "Order" in priorities.columns:
-        priorities["Order"] = range(1, len(priorities) + 1)
-    scoped["priorities"] = priorities
-    scoped["top20"] = priorities.head(20).copy()
-
-    # Calculate descriptive mixes strictly from the scoped queue/Top 20.
-    top20 = scoped["top20"].copy()
-    exec_col = find_col(top20, ["Service Executive Name"])
-    franchise_col = find_col(top20, ["Franchise Name"])
-    status_col = find_col(top20, ["Status"])
-    if len(top20):
-        if exec_col:
-            exec_vals = top20[exec_col].map(lambda v: clean_text(v) or "Unspecified")
-            counts = exec_vals.value_counts()
-            top20["Executive % of Top 20"] = exec_vals.map(counts).astype(float) * 100 / len(top20)
-            ex_summary = pd.DataFrame({"Executive": counts.index, "Top 20 Calls": counts.values})
-            ex_summary["Share of Top 20 (%)"] = ex_summary["Top 20 Calls"] * 100 / len(top20)
-        else:
-            top20["Executive % of Top 20"] = 100.0
-            ex_summary = pd.DataFrame({"Executive": ["Unspecified"], "Top 20 Calls": [len(top20)], "Share of Top 20 (%)": [100.0]})
-        if franchise_col:
-            fr_vals = top20[franchise_col].map(lambda v: clean_text(v) or "Unspecified")
-            counts_fr = fr_vals.value_counts()
-            top20["Franchise % of Top 20"] = fr_vals.map(counts_fr).astype(float) * 100 / len(top20)
-            fr_top_summary = pd.DataFrame({"Franchise": counts_fr.index, "Top 20 Calls": counts_fr.values})
-            fr_top_summary["Share of Top 20 (%)"] = fr_top_summary["Top 20 Calls"] * 100 / len(top20)
-        else:
-            top20["Franchise % of Top 20"] = 100.0
-            fr_top_summary = pd.DataFrame({"Franchise": ["Unspecified"], "Top 20 Calls": [len(top20)], "Share of Top 20 (%)": [100.0]})
-        if status_col:
-            st_vals = top20[status_col].map(lambda v: clean_text(v) or "Unspecified")
-            counts_st = st_vals.value_counts()
-            st_top_summary = pd.DataFrame({"Status": counts_st.index, "Top 20 Calls": counts_st.values})
-            st_top_summary["Share of Top 20 (%)"] = st_top_summary["Top 20 Calls"] * 100 / len(top20)
-        else:
-            st_top_summary = pd.DataFrame(columns=["Status", "Top 20 Calls", "Share of Top 20 (%)"])
-        ex_summary = ex_summary.sort_values(["Top 20 Calls", "Executive"], ascending=[False, True], kind="stable").reset_index(drop=True)
-        fr_top_summary = fr_top_summary.sort_values(["Top 20 Calls", "Franchise"], ascending=[False, True], kind="stable").reset_index(drop=True)
-        st_top_summary = st_top_summary.sort_values("Top 20 Calls", ascending=False, kind="stable").reset_index(drop=True)
-        scoped["top20"] = top20
-    else:
-        scoped["top20_executive_summary"] = pd.DataFrame(columns=["Executive", "Top 20 Calls", "Share of Top 20 (%)"])
-        ex_summary = scoped["top20_executive_summary"]
-        fr_top_summary = pd.DataFrame(columns=["Franchise", "Top 20 Calls", "Share of Top 20 (%)"])
-        st_top_summary = pd.DataFrame(columns=["Status", "Top 20 Calls", "Share of Top 20 (%)"])
-    scoped["top20_executive_summary"] = ex_summary
-    scoped["top20_franchise_summary"] = fr_top_summary
-    scoped["top20_status_summary"] = st_top_summary
-
-    # Reconcile source-row counts and exclusions for the current selection.
-    current = analysis["current_pending_report"]
-    all_reports = analysis.get("reports", [])
-    active_grouped, active_rows, active_stats = active_pending_data(current, all_reports)
-    active_rows_scoped, _ = _filter_to_scope(active_rows, mode, selection)
-    scoped["current_pending_rows"] = len(active_rows_scoped)
-    scoped["current_unique_tickets"] = len(priorities)
-
-    filtered_source = filter_pending_call_types(current.get("df", pd.DataFrame()))
-    filtered_source_scoped, scope_col_supported = _filter_to_scope(filtered_source, mode, selection)
-    ticket_col = get_ticket_col(filtered_source_scoped)
-    source_ids = {clean_text(v) for v in filtered_source_scoped[ticket_col].tolist() if clean_text(v)} if ticket_col else set()
-    scoped["current_source_distinct_tickets"] = len(source_ids)
-    active_ids = set(priorities["Ticket No"].map(clean_text)) if "Ticket No" in priorities.columns else set()
-    soft_ids = set(active_stats.get("soft_closed_ids", set())) & source_ids
-    negative_ids = set(active_stats.get("negative_response_ids", set())) & source_ids
-    scoped["soft_closed_tickets_excluded"] = len(soft_ids)
-    scoped["negative_response_tickets_excluded"] = len(negative_ids - soft_ids)
-    scoped["prior_unique_tickets"] = None
-
-    # Scope comparison movement: count new/continuing from the current scope and missing from the previous scope.
-    comp = analysis.get("comparison", pd.DataFrame()).copy()
-    if mode != "branch" and not comp.empty:
-        if mode == "franchise":
-            prev_key, cur_key = "Previous Franchise", "Current Franchise"
-        else:
-            prev_key, cur_key = "Previous Executive", "Current Executive"
-        if prev_key in comp.columns and cur_key in comp.columns:
-            prev_match = comp[prev_key].map(norm) == norm(selection)
-            cur_match = comp[cur_key].map(norm) == norm(selection)
-            movement_col = find_col(comp, ["Movement"])
-            movement_text = comp[movement_col].map(clean_text) if movement_col else pd.Series("", index=comp.index)
-            new_mask = movement_text.str.startswith("Newly present") & cur_match
-            missing_mask = movement_text.str.startswith("No longer present") & prev_match
-            common_scope = prev_match & cur_match
-            continuing_mask = common_scope & movement_text.str.startswith(("Present",))
-            changed_mask = common_scope & movement_text.str.contains("status changed", case=False)
-            age_mask = common_scope & movement_text.str.contains("age increased", case=False)
-            scoped["movement_counts"] = {"new": int(new_mask.sum()), "continuing": int(continuing_mask.sum()),
-                                         "missing": int(missing_mask.sum()), "status_changed": int(changed_mask.sum()),
-                                         "age_increased": int(age_mask.sum())}
-            scoped["comparison"] = comp.loc[new_mask | missing_mask | common_scope].copy().reset_index(drop=True)
-        else:
-            scoped["movement_counts"] = {"new": 0, "continuing": 0, "missing": 0, "status_changed": 0, "age_increased": 0}
-            scoped["comparison"] = pd.DataFrame()
-    else:
-        scoped["movement_counts"] = analysis["movement_counts"]
-        scoped["comparison"] = comp
-
-    # Scoped status, call type, age-band and franchise/executive/technician summaries.
-    scoped["status_summary"] = _simple_counts(priorities, ["Status"], "Status")
-    scoped["call_type_summary"] = _simple_counts(priorities, ["Call Type"], "Call Type")
-    scoped["age_summary"] = pd.cut(
-        priorities["Days Old"], bins=[-1, 0, 2, 6, 13, 29, float("inf")],
-        labels=["0 days", "1–2 days", "3–6 days", "7–13 days", "14–29 days", "30+ days"],
-    ).value_counts(sort=False).rename_axis("Age Bucket").reset_index(name="Unique Tickets")
-    scoped["older_7"] = int((priorities["Days Old"] >= 7).sum())
-    scoped["escalated"] = int(priorities.get("Has Escalation", pd.Series(False, index=priorities.index)).astype(bool).sum())
-    scoped["repeat_calls"] = int(priorities.get("Is Repeat Call", pd.Series(False, index=priorities.index)).astype(bool).sum())
-    scoped["overdue_scheduled"] = int(priorities.get("Scheduled Overdue", pd.Series(False, index=priorities.index)).astype(bool).sum())
-
-    franchise_col_all = find_col(priorities, ["Franchise Name"])
-    if franchise_col_all:
-        temp = priorities.copy()
-        temp["Franchise"] = temp[franchise_col_all].map(lambda v: clean_text(v) or "Unspecified")
-        scoped["franchise_summary"] = temp.groupby("Franchise", dropna=False).agg(
-            **{"Pending Tickets": ("Ticket No", "count"),
-               "Aged >2 Days": ("Days Old", lambda x: int((pd.to_numeric(x, errors="coerce").fillna(0) > 2).sum())),
-               "Aged 7+ Days": ("Days Old", lambda x: int((pd.to_numeric(x, errors="coerce").fillna(0) >= 7).sum())),
-               "Escalated Tickets": ("Has Escalation", lambda x: int(x.astype(bool).sum())),
-               "Repeat-call Flags": ("Is Repeat Call", lambda x: int(x.astype(bool).sum())),
-               "Average Age (days)": ("Days Old", lambda x: round(pd.to_numeric(x, errors="coerce").fillna(0).mean(), 1)),
-            }
-        ).reset_index().sort_values(["Aged >2 Days", "Pending Tickets"], ascending=False, kind="stable").reset_index(drop=True)
-    else:
-        scoped["franchise_summary"] = pd.DataFrame(columns=["Franchise", "Pending Tickets", "Aged >2 Days", "Aged 7+ Days", "Escalated Tickets", "Repeat-call Flags", "Average Age (days)"])
-
-    ex_col_all = find_col(priorities, ["Service Executive Name"])
-    if ex_col_all:
-        temp = priorities.copy()
-        temp["Executive"] = temp[ex_col_all].map(lambda v: clean_text(v) or "Unspecified")
-        scoped["executive_summary"] = temp.groupby("Executive", dropna=False).agg(
-            **{"Pending Tickets": ("Ticket No", "count"), "Aged 7+ Days": ("Days Old", lambda x: int((x >= 7).sum())),
-               "Escalated Tickets": ("Has Escalation", lambda x: int(x.astype(bool).sum())),
-               "Repeat-call Flags": ("Is Repeat Call", lambda x: int(x.astype(bool).sum())),
-               "Overdue Scheduled": ("Scheduled Overdue", lambda x: int(x.astype(bool).sum())),
-               "Average Age (days)": ("Days Old", lambda x: round(float(x.mean()), 1))}
-        ).reset_index().sort_values("Pending Tickets", ascending=False, kind="stable").reset_index(drop=True)
-    else:
-        scoped["executive_summary"] = pd.DataFrame(columns=["Executive", "Pending Tickets", "Aged 7+ Days", "Escalated Tickets", "Repeat-call Flags", "Overdue Scheduled", "Average Age (days)"])
-
-    tech_col = find_col(priorities, ["Technician Name"])
-    if tech_col:
-        tech = priorities.copy()
-        tech["Technician"] = tech[tech_col].map(lambda v: clean_text(v) or "Unspecified")
-        scoped["technician_summary"] = tech.groupby("Technician", dropna=False).agg(
-            **{"Pending Tickets": ("Ticket No", "count"), "Aged >2 Days": ("Days Old", lambda x: int((x > 2).sum())),
-               "Aged 7+ Days": ("Days Old", lambda x: int((x >= 7).sum()))}
-        ).reset_index().sort_values(["Pending Tickets", "Aged 7+ Days"], ascending=False, kind="stable").reset_index(drop=True)
-    else:
-        scoped["technician_summary"] = pd.DataFrame(columns=["Technician", "Pending Tickets", "Aged >2 Days", "Aged 7+ Days"])
-
-    # Exclusion call types within the selected scope.
-    source_all = current.get("df", pd.DataFrame())
-    ex_mask = excluded_pending_call_type_mask(source_all)
-    excluded_by_type = source_all.loc[ex_mask].copy()
-    excluded_by_type_scoped, _ = _filter_to_scope(excluded_by_type, mode, selection)
-    scoped["excluded_pending_rows"] = len(excluded_by_type_scoped)
-    scoped["excluded_pending_tickets"] = distinct_ticket_count(excluded_by_type_scoped)
-    missing_ticket_col = get_ticket_col(filtered_source_scoped)
-    missing_ticket_count = int(filtered_source_scoped[missing_ticket_col].map(lambda x: not bool(clean_text(x))).sum()) if missing_ticket_col else len(filtered_source_scoped)
-    missing_schedule = int(priorities["Scheduled Date"].map(lambda x: not bool(clean_text(x)) or (parse_dt(x) is None)).sum()) if "Scheduled Date" in priorities else len(priorities)
-    scoped["data_quality_metrics"] = {
-        "missing_executive": int(priorities.get("Missing Executive", pd.Series(False, index=priorities.index)).astype(bool).sum()),
-        "missing_technician": int(priorities.get("Missing Technician", pd.Series(False, index=priorities.index)).astype(bool).sum()),
-        "missing_schedule": missing_schedule,
-        "missing_ticket_number": missing_ticket_count,
-        "rows_beyond_distinct_tickets": max(0, len(active_rows_scoped) - len(priorities)),
-        "soft_closed_tickets_excluded": len(soft_ids),
-        "negative_response_tickets_excluded": len(negative_ids - soft_ids),
-        "current_source_distinct_tickets": len(source_ids),
-    }
-
-    # Scope the satisfaction and registered-call datasets only when their own report has the required field.
-    csat_report = analysis.get("csat_report")
-    csat_source = csat_report.get("df", pd.DataFrame()) if csat_report else pd.DataFrame()
-    csat_filtered, csat_key_supported = _filter_to_scope(csat_source, mode, selection)
-    if mode != "branch" and not csat_key_supported:
-        csat_filtered = csat_source.iloc[0:0].copy()
-    scoped["csat"] = csat_filtered
-    scoped["csat_summary"], scoped["csat_metrics"] = _feedback_outputs(csat_filtered)
-    scoped["csat_scope_supported"] = csat_key_supported
-    previous_csat_report = analysis.get("csat_previous_report")
-    previous_csat_df = previous_csat_report.get("df", pd.DataFrame()) if previous_csat_report else pd.DataFrame()
-    previous_csat_filtered, prev_csat_supported = _filter_to_scope(previous_csat_df, mode, selection)
-    prev_sum, prev_metrics = _feedback_outputs(previous_csat_filtered)
-    css_delta = None
-    if prev_metrics.get("css_pct") is not None and scoped["csat_metrics"].get("css_pct") is not None:
-        css_delta = round(scoped["csat_metrics"]["css_pct"] - prev_metrics["css_pct"], 2)
-    scoped["csat_movement"] = dict(analysis.get("csat_movement", {}))
-    scoped["csat_movement"]["css_delta_pp"] = css_delta
-    scoped["csat_movement"]["previous_rows"] = prev_metrics.get("total") if previous_csat_report else None
-    scoped["csat_movement"]["current_rows"] = scoped["csat_metrics"].get("total", 0)
-
-    # Scope Calls Registered figures too, when a matching column is available.
-    reg = analysis.get("registered", pd.DataFrame()).copy()
-    reg_day = analysis.get("registered_for_day", pd.DataFrame()).copy()
-    reg_scoped, reg_supported = _filter_to_scope(reg, mode, selection)
-    reg_day_scoped, reg_day_supported = _filter_to_scope(reg_day, mode, selection)
-    if mode != "branch" and (not reg_supported or not reg_day_supported):
-        scoped["registered_count"] = None
-        scoped["registered_for_day"] = reg_day.iloc[0:0].copy()
-    else:
-        scoped["registered_for_day"] = reg_day_scoped
-        col_reg = get_ticket_col(reg_day_scoped)
-        scoped["registered_count"] = len({clean_text(x) for x in reg_day_scoped[col_reg] if clean_text(x)}) if col_reg and analysis.get("registered_count") is not None else analysis.get("registered_count")
-    scoped["registered"] = reg_scoped
-
-    # Add scope metadata for reporting and group-update snapshots.
-    scoped["scope_summary"] = {
-        "mode": mode,
-        "selection": clean_text(selection),
-        "active_tickets": len(priorities),
-        "aged_over_2": int((priorities["Days Old"] > 2).sum()),
-        "aged_7_plus": int((priorities["Days Old"] >= 7).sum()),
-        "oldest_days": int(priorities["Days Old"].max()) if not priorities.empty else None,
-        "status_counts": scoped["status_summary"].to_dict("records"),
-        "csat_scoped": bool(csat_key_supported or mode == "branch"),
-    }
-    return scoped
-
-
 def _date_label(value: Any) -> str:
     try:
         return pd.Timestamp(value).strftime("%d %b %Y")
@@ -1183,33 +874,24 @@ def _snapshot_status(analysis: Dict[str, Any]) -> str:
 
 
 def make_priority_png(analysis: Dict[str, Any]) -> bytes:
-    """Render the 20 oldest tickets with a scope-appropriate descriptive chart."""
+    """Render the 20 oldest pending tickets plus an executive-share bar chart."""
     import matplotlib.pyplot as plt
     import numpy as np
     import textwrap
 
-    mode = analysis.get("scope_mode", "branch")
-    selection = clean_text(analysis.get("scope_selection", ""))
     data = analysis["top20"].copy().head(20)
     snap = analysis["current_pending_report"]["snapshot_dt"]
     fig = plt.figure(figsize=(21, 11.2), dpi=160, facecolor="#FFFFFF")
 
-    if mode == "franchise":
-        title = f"Pending calls — {selection}: 20 oldest tickets"
-        context = f"Franchise view: {selection}"
-    elif mode == "executive":
-        title = f"Pending calls — {selection}: 20 oldest tickets"
-        context = f"Executive view: all franchises assigned to {selection}"
-    else:
-        title = "Pending calls — 20 oldest tickets"
-        context = "Hyderabad Service Branch"
-    fig.text(0.018, 0.962, title, fontsize=20, color="#303236", va="top")
+    # Header
+    fig.text(0.018, 0.962, "Pending calls — 20 oldest tickets", fontsize=20, color="#303236", va="top")
     fig.text(0.018, 0.925,
-             f"{context}  |  As of {snap.strftime('%d %b %Y, %I:%M %p')}  |  Ordered by call age, oldest first",
+             f"Hyderabad Service Branch  |  As of {snap.strftime('%d %b %Y, %I:%M %p')}  |  Ordered by call age, oldest first",
              fontsize=10, color="#5B6570", va="top")
     fig.text(0.982, 0.962, f"{analysis['current_unique_tickets']:,} ACTIVE PENDING TICKETS",
              fontsize=11, weight="bold", ha="right", va="top", color="#303030")
 
+    # Table occupies its own top panel; leave a clear gap for the chart below.
     ax = fig.add_axes([0.012, 0.305, 0.976, 0.555])
     ax.axis("off")
     col_def = [
@@ -1222,13 +904,10 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
         ("Technician Name", "Technician", 0.110),
         ("Call Type", "Call Type", 0.105),
         ("Status", "Status", 0.100),
+        ("Executive % of Top 20", "Exec. % of Top 20", 0.080),
     ]
-    if mode == "branch":
-        col_def.append(("Executive % of Top 20", "Exec. % of Top 20", 0.080))
-    elif mode == "executive":
-        col_def.append(("Franchise % of Top 20", "Franchise % of Top 20", 0.080))
     present = [(src, label, width) for src, label, width in col_def if src in data.columns]
-    total = sum(c[2] for c in present) or 1
+    total = sum(c[2] for c in present)
     col_widths = [c[2] / total for c in present]
 
     rows = []
@@ -1236,15 +915,18 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
         vals = []
         for src, _, _ in present:
             value = clean_text(row.get(src, ""))
-            if src in {"Executive % of Top 20", "Franchise % of Top 20"} and value:
+            if src == "Executive % of Top 20" and value:
                 try:
                     value = f"{float(value):.1f}%"
                 except (TypeError, ValueError):
                     pass
             limit = {
-                "Franchise Name": 30, "Customer Name": 26,
-                "Service Executive Name": 27, "Technician Name": 23,
-                "Call Type": 20, "Status": 20,
+                "Franchise Name": 30,
+                "Customer Name": 26,
+                "Service Executive Name": 27,
+                "Technician Name": 23,
+                "Call Type": 20,
+                "Status": 20,
             }.get(src)
             if limit and len(value) > limit:
                 value = value[:limit - 3] + "..."
@@ -1254,12 +936,16 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
     table = ax.table(
         cellText=rows,
         colLabels=[label for _, label, _ in present],
-        cellLoc="left", colLoc="center", loc="center",
-        colWidths=col_widths, bbox=[0.0, 0.0, 1.0, 1.0],
+        cellLoc="left",
+        colLoc="center",
+        loc="center",
+        colWidths=col_widths,
+        bbox=[0.0, 0.0, 1.0, 1.0],
     )
     table.auto_set_font_size(False)
     table.set_fontsize(8.2)
-    centered = {"Order", "Days Old", "Executive % of Top 20", "Franchise % of Top 20"}
+
+    centered = {"Order", "Days Old", "Executive % of Top 20"}
     for (r, c), cell in table.get_celld().items():
         cell.set_edgecolor("#D0D4D8")
         cell.set_linewidth(0.55)
@@ -1274,70 +960,59 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
             cell.set_facecolor("#FFFFFF")
             cell.get_text().set_color("#202326")
             cell.set_height(0.034)
-            if present[c][0] in centered:
+            src = present[c][0]
+            if src in centered:
                 cell.get_text().set_ha("center")
-            if present[c][0] == "Order":
+            if src == "Order":
                 cell.get_text().set_weight("bold")
 
-    # The lower chart changes by view; it is descriptive only and never affects ordering.
-    if mode == "franchise":
-        chart = analysis.get("top20_status_summary", pd.DataFrame()).copy()
-        category_col = "Status"
-        chart_title = "Top 20 calls by status — franchise update"
-    elif mode == "executive":
-        chart = analysis.get("top20_franchise_summary", pd.DataFrame()).copy()
-        category_col = "Franchise"
-        if len(chart) <= 1:
-            chart = analysis.get("top20_status_summary", pd.DataFrame()).copy()
-            category_col = "Status"
-            chart_title = "Top 20 calls by status — executive update"
-        else:
-            chart_title = "Top 20 calls across your franchises"
-    else:
-        chart = analysis.get("top20_executive_summary", pd.DataFrame()).copy()
-        category_col = "Executive"
-        chart_title = "Top 20 calls by service executive"
-
-    if not chart.empty and category_col in chart.columns and "Top 20 Calls" in chart.columns:
-        chart["Top 20 Calls"] = pd.to_numeric(chart["Top 20 Calls"], errors="coerce").fillna(0)
-        chart["Share of Top 20 (%)"] = pd.to_numeric(chart.get("Share of Top 20 (%)", 0), errors="coerce").fillna(0)
-        chart[category_col] = chart[category_col].map(lambda v: clean_text(v) or "Unspecified")
-        chart = chart.sort_values("Top 20 Calls", ascending=False, kind="stable").copy()
-        if len(chart) > 6:
-            main = chart.head(5).copy()
-            rest = chart.iloc[5:]
-            main = pd.concat([main, pd.DataFrame([{
-                category_col: "Other", "Top 20 Calls": int(rest["Top 20 Calls"].sum()),
-                "Share of Top 20 (%)": float(rest["Share of Top 20 (%)"].sum()),
+    # Executive mix chart for only the 20 calls shown in the table. This is descriptive,
+    # not a priority score, and the bar labels show both ticket count and share of Top 20.
+    ex = analysis.get("top20_executive_summary", pd.DataFrame()).copy()
+    if not ex.empty:
+        ex["Top 20 Calls"] = pd.to_numeric(ex["Top 20 Calls"], errors="coerce").fillna(0)
+        ex["Share of Top 20 (%)"] = pd.to_numeric(ex["Share of Top 20 (%)"], errors="coerce").fillna(0)
+        ex["Executive"] = ex["Executive"].map(lambda v: clean_text(v) or "Unspecified")
+        ex = ex.sort_values(["Top 20 Calls", "Executive"], ascending=[False, True], kind="stable").copy()
+        if len(ex) > 6:
+            top = ex.head(5).copy()
+            other = ex.iloc[5:]
+            top = pd.concat([top, pd.DataFrame([{
+                "Executive": "Other executives",
+                "Top 20 Calls": int(other["Top 20 Calls"].sum()),
+                "Share of Top 20 (%)": float(other["Share of Top 20 (%)"].sum()),
             }])], ignore_index=True)
-            chart = main
-        labels = [textwrap.fill(v, width=29, break_long_words=False) for v in chart[category_col].astype(str)]
-        y = np.arange(len(chart))
-        counts = chart["Top 20 Calls"].to_numpy(dtype=float)
-        shares = chart["Share of Top 20 (%)"].to_numpy(dtype=float)
-        chart_ax = fig.add_axes([0.19, 0.075, 0.735, 0.155])
-        chart_ax.barh(y, counts, color="#3A78A5", height=0.58)
-        chart_ax.set_yticks(y)
-        chart_ax.set_yticklabels(labels, fontsize=7.8, color="#263746")
-        chart_ax.invert_yaxis()
-        chart_ax.set_title(chart_title, loc="left", fontsize=10.5, color="#18344D", fontweight="bold", pad=5)
-        chart_ax.tick_params(axis="x", labelsize=7.5, colors="#435365", length=0, pad=3)
-        chart_ax.tick_params(axis="y", length=0, pad=7)
-        chart_ax.xaxis.grid(True, color="#E3E8ED", linewidth=0.65)
-        chart_ax.set_axisbelow(True)
-        for spine in chart_ax.spines.values():
+            ex = top
+        labels = [textwrap.fill(v, width=26, break_long_words=False) for v in ex["Executive"].astype(str)]
+        y = np.arange(len(ex))
+        counts = ex["Top 20 Calls"].to_numpy(dtype=float)
+        shares = ex["Share of Top 20 (%)"].to_numpy(dtype=float)
+        ax_exec = fig.add_axes([0.19, 0.075, 0.735, 0.155])
+        ax_exec.barh(y, counts, color="#3A78A5", height=0.58)
+        ax_exec.set_yticks(y)
+        ax_exec.set_yticklabels(labels, fontsize=7.8, color="#263746")
+        ax_exec.invert_yaxis()
+        ax_exec.set_title("Top 20 calls by service executive", loc="left", fontsize=10.5,
+                          color="#18344D", fontweight="bold", pad=5)
+        ax_exec.tick_params(axis="x", labelsize=7.5, colors="#435365", length=0, pad=3)
+        ax_exec.tick_params(axis="y", length=0, pad=7)
+        ax_exec.xaxis.grid(True, color="#E3E8ED", linewidth=0.65)
+        ax_exec.set_axisbelow(True)
+        for spine in ax_exec.spines.values():
             spine.set_visible(False)
         xmax = max(float(counts.max()), 1.0)
-        chart_ax.set_xlim(0, xmax * 1.42)
-        chart_ax.set_xlabel("Number of calls in Top 20", fontsize=7.5, color="#435365", labelpad=2)
+        ax_exec.set_xlim(0, xmax * 1.36)
+        ax_exec.set_xlabel("Number of calls in Top 20", fontsize=7.5, color="#435365", labelpad=2)
         for yy, count, share in zip(y, counts, shares):
-            chart_ax.text(count + xmax * 0.025, yy, f"{int(count)} calls  ·  {share:.1f}%",
-                          va="center", ha="left", fontsize=7.6, color="#263746", weight="bold")
+            ax_exec.text(count + xmax * 0.025, yy, f"{int(count)} calls  ·  {share:.1f}%",
+                         va="center", ha="left", fontsize=7.6, color="#263746", weight="bold")
     else:
-        fig.text(0.018, 0.15, "No chartable calls in this view.", fontsize=9, color="#435365")
+        fig.text(0.018, 0.15, "Executive distribution unavailable: no executive names found in the Top 20.",
+                 fontsize=9, color="#435365")
 
-    note = "Sorted only by Days Old, highest to lowest. No weighted score or escalation-based ranking is used."
-    fig.text(0.018, 0.025, note, fontsize=8.7, color="#4F5963", va="bottom")
+    fig.text(0.018, 0.025,
+             "Sorted only by Days Old, oldest first. Bar chart shows executive share of the 20 calls displayed; no priority score is used.",
+             fontsize=8.7, color="#4F5963", va="bottom")
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -1345,7 +1020,7 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
 
 
 def make_management_png(analysis: Dict[str, Any]) -> bytes:
-    """Create a high-contrast management image whose charts adapt to the selected view."""
+    """Create a high-contrast, one-page management summary with fixed non-overlapping panels."""
     import matplotlib.pyplot as plt
     import numpy as np
     import textwrap
@@ -1359,27 +1034,19 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     muted = "#435365"
     grid = "#E3E8ED"
     page = "#F3F6F8"
-    mode = analysis.get("scope_mode", "branch")
-    selection = clean_text(analysis.get("scope_selection", ""))
 
+    # A little taller than the earlier version creates more breathing room for labels and notes.
     fig = plt.figure(figsize=(16, 11), dpi=180, facecolor=page)
-    if mode == "franchise":
-        heading = "SERVICE OPERATIONS | FRANCHISE DAILY UPDATE"
-        scope_subtitle = f"Franchise: {selection}"
-    elif mode == "executive":
-        heading = "SERVICE OPERATIONS | EXECUTIVE DAILY BRIEF"
-        scope_subtitle = f"Service Executive: {selection} · All assigned franchise queues"
-    else:
-        heading = "SERVICE OPERATIONS | DAILY MANAGEMENT BRIEF"
-        scope_subtitle = "Hyderabad Branch"
-    fig.text(0.04, 0.962, heading, fontsize=19, weight="bold", color=navy, va="top")
+    fig.text(0.04, 0.962, "SERVICE OPERATIONS | DAILY MANAGEMENT BRIEF",
+             fontsize=20, weight="bold", color=navy, va="top")
     fig.text(0.04, 0.923,
-             f"{scope_subtitle}  ·  Report date {_date_label(analysis['analysis_date'])}  ·  {_snapshot_status(analysis)}",
-             fontsize=9.8, color=muted, va="top")
+             f"Hyderabad Branch  ·  Report date {_date_label(analysis['analysis_date'])}  ·  {_snapshot_status(analysis)}",
+             fontsize=10.2, color=muted, va="top")
     snap = analysis["current_pending_report"]["snapshot_dt"]
     fig.text(0.96, 0.962, f"AS OF {snap.strftime('%d %b %Y  %I:%M %p')}",
-             fontsize=9.3, weight="bold", color=teal, ha="right", va="top")
+             fontsize=9.5, weight="bold", color=teal, ha="right", va="top")
 
+    # KPI tiles have consistent widths, baselines, and padding.
     current = analysis["current_unique_tickets"]
     mc = analysis["movement_counts"]
     css_rounded = analysis["csat_metrics"].get("css_pct_rounded")
@@ -1394,106 +1061,111 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     x0, step, card_w = 0.04, 0.155, 0.143
     for i, (label, value, value_color) in enumerate(kpis):
         x = x0 + i * step
-        fig.patches.append(plt.Rectangle((x, 0.817), card_w, 0.078, transform=fig.transFigure,
-                                         facecolor="#FFFFFF", edgecolor="#D8E0E7", linewidth=1.0, zorder=0))
-        fig.text(x + 0.010, 0.868, label, fontsize=7.1, color=muted, weight="bold", va="center")
-        fig.text(x + 0.010, 0.835, value, fontsize=17, color=value_color, weight="bold", va="center")
+        fig.patches.append(plt.Rectangle(
+            (x, 0.817), card_w, 0.078, transform=fig.transFigure,
+            facecolor="#FFFFFF", edgecolor="#D8E0E7", linewidth=1.0, zorder=0
+        ))
+        fig.text(x + 0.010, 0.868, label, fontsize=7.5, color=muted,
+                 weight="bold", va="center")
+        fig.text(x + 0.010, 0.835, value, fontsize=17, color=value_color,
+                 weight="bold", va="center")
 
-    def style_axis(ax, title, title_size=11.2):
+    def style_axis(ax, title, title_size=11.5):
         ax.set_facecolor("#FFFFFF")
-        ax.set_title(title, loc="left", color=navy, fontsize=title_size, fontweight="bold", pad=9)
-        ax.tick_params(axis="both", labelsize=8.0, colors=ink, length=0, pad=4)
-        ax.grid(axis="x", color=grid, linewidth=0.7)
+        ax.set_title(title, loc="left", color=navy, fontsize=title_size,
+                     fontweight="bold", pad=10)
+        ax.tick_params(axis="both", labelsize=8.3, colors=ink, length=0, pad=5)
+        ax.grid(axis="x", color=grid, linewidth=0.75)
         ax.set_axisbelow(True)
         for spine in ax.spines.values():
             spine.set_visible(False)
 
-    def draw_hbar(ax, frame, label_col, value_col, title, share_col=None, max_rows=5):
-        df = frame.copy() if frame is not None else pd.DataFrame()
-        if df.empty or label_col not in df.columns or value_col not in df.columns:
-            ax.axis("off")
-            ax.text(0.03, 0.5, "No matching data available for this view.", color=muted,
-                    fontsize=9, transform=ax.transAxes, va="center")
-            ax.set_title(title, loc="left", color=navy, fontsize=11.2, fontweight="bold", pad=9)
-            return
-        df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0)
-        df = df.sort_values(value_col, ascending=False, kind="stable").head(max_rows).copy()
-        df[label_col] = df[label_col].map(lambda x: clean_text(x) or "Unspecified")
-        labels = [textwrap.fill(v, width=24, break_long_words=False) for v in df[label_col].astype(str)]
-        vals = df[value_col].to_numpy(dtype=float)
-        y = np.arange(len(df))
-        ax.barh(y, vals, color="#3A78A5", height=0.58)
-        ax.set_yticks(y)
-        ax.set_yticklabels(labels, fontsize=7.6, color=ink)
-        ax.invert_yaxis()
-        style_axis(ax, title)
-        ax.tick_params(axis="y", labelsize=7.6, colors=ink, pad=4)
-        xmax = max(float(vals.max()), 1)
-        ax.set_xlim(0, xmax * 1.38)
-        if share_col and share_col in df.columns:
-            shares = pd.to_numeric(df[share_col], errors="coerce").fillna(0).to_numpy(dtype=float)
-        else:
-            total = float(pd.to_numeric(frame[value_col], errors="coerce").fillna(0).sum()) or 1.0
-            shares = vals * 100.0 / total
-        for yy, val, share in zip(y, vals, shares):
-            ax.text(val + xmax * 0.025, yy, f"{int(val):,}  ·  {share:.1f}%", va="center", ha="left",
-                    fontsize=7.4, color=ink, weight="bold")
-
-    # Top-left: ageing always reflects the queue represented by the current view.
+    # Fixed chart grid: axes never intrude into the bottom management notes.
     ax_age = fig.add_axes([0.075, 0.545, 0.37, 0.205])
     age = analysis["age_summary"].copy()
     if not age.empty:
         age["Unique Tickets"] = pd.to_numeric(age["Unique Tickets"], errors="coerce").fillna(0)
         age_colors = ["#A8BAC8", "#8AA9BC", "#648EA8", "#2E8588", "#D39A35", "#B94842"]
-        ax_age.barh(age["Age Bucket"].astype(str), age["Unique Tickets"], color=age_colors[:len(age)], height=0.62)
+        ax_age.barh(age["Age Bucket"].astype(str), age["Unique Tickets"],
+                    color=age_colors[:len(age)], height=0.62)
         ax_age.invert_yaxis()
         style_axis(ax_age, "Pending backlog by age")
-        ax_age.tick_params(axis="y", labelsize=8.4, colors=ink)
+        ax_age.tick_params(axis="y", labelsize=8.6, colors=ink)
         xmax = max(float(age["Unique Tickets"].max()), 1)
-        ax_age.set_xlim(0, xmax * 1.14)
+        ax_age.set_xlim(0, xmax * 1.13)
         for y, val in enumerate(age["Unique Tickets"].to_numpy()):
-            ax_age.text(val + xmax * 0.015, y, f"{int(val):,}", va="center", ha="left", fontsize=8.1, color=ink, weight="bold")
+            ax_age.text(val + xmax * 0.015, y, f"{int(val):,}", va="center",
+                        ha="left", fontsize=8.2, color=ink, weight="bold")
         ax_age.grid(axis="y", visible=False)
     else:
         ax_age.axis("off")
-        ax_age.text(0.03, 0.5, "No calls in this view.", color=muted, fontsize=10, transform=ax_age.transAxes, va="center")
+        ax_age.text(0.03, 0.5, "Ageing data unavailable", color=muted, fontsize=10,
+                    transform=ax_age.transAxes, va="center")
 
-    # Top-right chart adapts to the view: branch=executives, franchise=statuses, executive=franchises.
-    ax_main = fig.add_axes([0.575, 0.545, 0.35, 0.205])
-    if mode == "franchise":
-        status_frame = analysis["status_summary"].copy()
-        draw_hbar(ax_main, status_frame, "Status", "Unique Tickets", "Franchise status update")
-    elif mode == "executive":
-        fr_frame = analysis["franchise_summary"].copy()
-        if len(fr_frame) > 1:
-            draw_hbar(ax_main, fr_frame, "Franchise", "Pending Tickets", "Your pending workload by franchise")
-        else:
-            status_frame = analysis["status_summary"].copy()
-            draw_hbar(ax_main, status_frame, "Status", "Unique Tickets", "Your call status mix")
+    ax_exec = fig.add_axes([0.575, 0.545, 0.35, 0.205])
+    ex = analysis.get("top20_executive_summary", pd.DataFrame()).copy()
+    if not ex.empty:
+        ex["Top 20 Calls"] = pd.to_numeric(ex["Top 20 Calls"], errors="coerce").fillna(0)
+        ex["Share of Top 20 (%)"] = pd.to_numeric(ex["Share of Top 20 (%)"], errors="coerce").fillna(0)
+        ex = ex.sort_values(["Top 20 Calls", "Executive"], ascending=[False, True], kind="stable").copy()
+        if len(ex) > 6:
+            top = ex.head(5).copy()
+            other = ex.iloc[5:]
+            top = pd.concat([top, pd.DataFrame([{
+                "Executive": "Other executives",
+                "Top 20 Calls": int(other["Top 20 Calls"].sum()),
+                "Share of Top 20 (%)": float(other["Share of Top 20 (%)"].sum()),
+            }])], ignore_index=True)
+            ex = top
+        labels = [textwrap.fill(clean_text(x), width=19, break_long_words=False) for x in ex["Executive"].astype(str)]
+        y = np.arange(len(ex))
+        totals = ex["Top 20 Calls"].to_numpy(dtype=float)
+        shares = ex["Share of Top 20 (%)"].to_numpy(dtype=float)
+        ax_exec.barh(y, totals, color="#3A78A5", height=0.56)
+        ax_exec.set_yticks(y, labels)
+        ax_exec.invert_yaxis()
+        style_axis(ax_exec, "Top 20 oldest calls by executive")
+        ax_exec.tick_params(axis="y", labelsize=7.5, colors=ink, pad=4)
+        xmax = max(float(totals.max()), 1)
+        ax_exec.set_xlim(0, xmax * 1.36)
+        for yy, count, share in zip(y, totals, shares):
+            ax_exec.text(count + xmax * 0.025, yy, f"{int(count):,}  ·  {share:.1f}%",
+                         va="center", ha="left", fontsize=7.7, color=ink, weight="bold")
+        ax_exec.grid(axis="y", visible=False)
     else:
-        ex_frame = analysis.get("top20_executive_summary", pd.DataFrame()).copy()
-        draw_hbar(ax_main, ex_frame, "Executive", "Top 20 Calls", "Top 20 oldest calls by executive", "Share of Top 20 (%)")
+        ax_exec.axis("off")
+        ax_exec.text(0.03, 0.5, "Executive assignment data unavailable", color=muted,
+                     fontsize=10, transform=ax_exec.transAxes, va="center")
 
-    # Bottom-left is also scoped: franchise updates show technicians; executive view uses status
-    # when they cover multiple franchises, or technician workload when they have a single franchise.
-    ax_secondary = fig.add_axes([0.105, 0.295, 0.36, 0.19])
-    if mode == "franchise":
-        tech_frame = analysis.get("technician_summary", pd.DataFrame()).copy()
-        draw_hbar(ax_secondary, tech_frame, "Technician", "Pending Tickets", "Technician follow-up workload")
-    elif mode == "executive":
-        if len(analysis["franchise_summary"]) > 1:
-            status_frame = analysis["status_summary"].copy()
-            draw_hbar(ax_secondary, status_frame, "Status", "Unique Tickets", "Your calls by status")
-        else:
-            tech_frame = analysis.get("technician_summary", pd.DataFrame()).copy()
-            draw_hbar(ax_secondary, tech_frame, "Technician", "Pending Tickets", "Technician follow-up workload")
+    ax_fr = fig.add_axes([0.12, 0.295, 0.325, 0.19])
+    fr = analysis["franchise_summary"].copy()
+    # This chart intentionally includes only distinct pending tickets aged strictly more than 2 days.
+    # It is separate from the overall backlog count shown in other management KPIs.
+    if not fr.empty and "Aged >2 Days" in fr.columns:
+        fr["Aged >2 Days"] = pd.to_numeric(fr["Aged >2 Days"], errors="coerce").fillna(0)
+        fr = fr.loc[fr["Aged >2 Days"] > 0]
+        fr = fr.sort_values("Aged >2 Days", ascending=False, kind="stable").head(5).copy()
     else:
-        fr_frame = analysis["franchise_summary"].copy()
-        # This branch view includes only unique active pending tickets aged strictly more than 2 days.
-        if not fr_frame.empty and "Aged >2 Days" in fr_frame.columns:
-            fr_frame["Aged >2 Days"] = pd.to_numeric(fr_frame["Aged >2 Days"], errors="coerce").fillna(0)
-            fr_frame = fr_frame.loc[fr_frame["Aged >2 Days"] > 0]
-        draw_hbar(ax_secondary, fr_frame, "Franchise", "Aged >2 Days", "Franchise calls pending >2 days")
+        fr = pd.DataFrame()
+    if not fr.empty:
+        labels = [textwrap.fill(clean_text(x), width=22) for x in fr["Franchise"].astype(str)]
+        y = np.arange(len(fr))
+        aged_over_two = fr["Aged >2 Days"].to_numpy()
+        ax_fr.barh(y, aged_over_two, color="#3A78A5", height=0.56)
+        ax_fr.set_yticks(y, labels)
+        ax_fr.invert_yaxis()
+        style_axis(ax_fr, "Franchise calls pending >2 days")
+        ax_fr.tick_params(axis="y", labelsize=8.2, colors=ink)
+        xmax = max(float(aged_over_two.max()), 1)
+        ax_fr.set_xlim(0, xmax * 1.18)
+        for yy, count in zip(y, aged_over_two):
+            ax_fr.text(count + xmax * 0.025, yy, f"{int(count):,}",
+                       va="center", ha="left", fontsize=8.3, color=ink, weight="bold")
+        ax_fr.grid(axis="y", visible=False)
+    else:
+        ax_fr.axis("off")
+        ax_fr.text(0.03, 0.5, "No franchise calls aged >2 days", color=muted,
+                   fontsize=10, transform=ax_fr.transAxes, va="center")
 
     ax_feedback = fig.add_axes([0.575, 0.295, 0.35, 0.19])
     csat_summary = analysis["csat_summary"].copy()
@@ -1505,67 +1177,77 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
         vals = pd.to_numeric(csat_summary["Share %"], errors="coerce").fillna(0).tolist()
         color_map = {"HAPPY": green, "OK": amber, "NOT HAPPY": red}
         bars = ax_feedback.bar(labels, vals, color=[color_map.get(x, "#8A9BA9") for x in labels], width=0.55)
-        feedback_title = "Customer feedback mix" if mode == "branch" else "Customer feedback for this view"
-        style_axis(ax_feedback, feedback_title)
-        ax_feedback.set_ylim(0, max(100, max(vals, default=0) * 1.17))
-        ax_feedback.tick_params(axis="x", labelsize=8.0, colors=ink, pad=5)
-        ax_feedback.tick_params(axis="y", labelsize=7.8, colors=ink)
+        style_axis(ax_feedback, "Customer feedback mix (% of responses)")
+        ax_feedback.set_ylim(0, 112)
+        ax_feedback.tick_params(axis="x", labelsize=8.4, colors=ink, pad=6)
+        ax_feedback.tick_params(axis="y", labelsize=8.0, colors=ink)
         ax_feedback.grid(axis="x", visible=False)
         for bar, val in zip(bars, vals):
-            ax_feedback.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
-                             f"{val:.1f}%", ha="center", va="bottom", fontsize=8.5, color=ink, weight="bold")
+            ax_feedback.text(bar.get_x() + bar.get_width() / 2, min(bar.get_height() + 2.0, 106),
+                             f"{val:.1f}%", ha="center", va="bottom", fontsize=9,
+                             color=ink, weight="bold")
     else:
         ax_feedback.axis("off")
-        title = "No customer feedback matched this view" if mode != "branch" and not analysis.get("csat_scope_supported", True) else "No Customer Satisfaction report uploaded for this view"
-        ax_feedback.text(0.03, 0.5, title, transform=ax_feedback.transAxes, color=muted, fontsize=9, va="center")
-        ax_feedback.set_title("Customer feedback", loc="left", color=navy, fontsize=11.2, fontweight="bold", pad=9)
+        ax_feedback.text(0.03, 0.5, "No Customer Satisfaction report uploaded",
+                         transform=ax_feedback.transAxes, color=muted, fontsize=10, va="center")
 
-    # Bottom information panel: readable line lengths with separate movement and data-quality columns.
-    fig.patches.append(plt.Rectangle((0.04, 0.045), 0.92, 0.20, transform=fig.transFigure,
-                                     facecolor="#FFFFFF", edgecolor="#D8E0E7", linewidth=1.0, zorder=0))
-    fig.text(0.055, 0.222, "SNAPSHOT MOVEMENT", fontsize=8.8, color=teal, weight="bold", va="center")
+    # Bounded, two-column insight panel. Explicit wrapping prevents long source data from
+    # running into charts or each other on the exported PNG.
+    fig.patches.append(plt.Rectangle((0.04, 0.045), 0.92, 0.20,
+                                     transform=fig.transFigure, facecolor="#FFFFFF",
+                                     edgecolor="#D8E0E7", linewidth=1.0, zorder=0))
+    fig.text(0.055, 0.222, "SNAPSHOT MOVEMENT", fontsize=9.0, color=teal,
+             weight="bold", va="center")
     prev = analysis["previous_pending_report"]
     if prev:
         movement_text = (
+            f"Previous: {prev['snapshot_dt'].strftime('%d %b %Y %I:%M %p')}  ·  "
             f"Newly present: {mc['new']:,}  ·  Continuing: {mc['continuing']:,}\n"
             f"No longer listed: {mc['missing']:,}  ·  Status changed: {mc['status_changed']:,}  ·  Age increased: {mc['age_increased']:,}"
         )
     else:
         movement_text = "Only one Pending Call snapshot was uploaded; hourly movement cannot yet be calculated."
-    fig.text(0.055, 0.199, textwrap.fill(movement_text, width=78), fontsize=8.1, color=ink, va="top", linespacing=1.45)
-    fig.text(0.055, 0.145, "A call absent from a later snapshot is not proof of closure.", fontsize=7.9, color=red, va="top")
+    fig.text(0.055, 0.199, movement_text, fontsize=8.4, color=ink,
+             va="top", linespacing=1.45)
+    caveat = "Note: a call no longer listed in a later snapshot is not proof of closure."
+    fig.text(0.055, 0.145, caveat, fontsize=8.1, color=red, va="top")
     status_counts = analysis["status_summary"].head(4)
     status_line = "Status mix: " + "  ·  ".join(
-        f"{clean_text(row['Status']) or 'Unspecified'} {int(row['Unique Tickets']):,}" for _, row in status_counts.iterrows()
+        f"{clean_text(row['Status']) or 'Unspecified'} {int(row['Unique Tickets']):,}"
+        for _, row in status_counts.iterrows()
     ) if not status_counts.empty else "Status mix: not available"
-    fig.text(0.055, 0.118, textwrap.fill(status_line, width=80), fontsize=7.8, color=muted, va="top")
+    fig.text(0.055, 0.118, status_line, fontsize=8.0, color=muted, va="top")
 
-    fig.lines.append(plt.Line2D([0.655, 0.655], [0.065, 0.225], transform=fig.transFigure, color="#E0E6EB", linewidth=1.0))
-    fig.text(0.675, 0.222, "DATA QUALITY & COVERAGE", fontsize=8.8, color=teal, weight="bold", va="center")
+    # Second column for data quality and coverage, separated by a vertical divider.
+    fig.lines.append(plt.Line2D([0.655, 0.655], [0.065, 0.225], transform=fig.transFigure,
+                                color="#E0E6EB", linewidth=1.0))
+    fig.text(0.675, 0.222, "DATA QUALITY & COVERAGE", fontsize=9.0, color=teal,
+             weight="bold", va="center")
     dq = analysis["data_quality_metrics"]
     dq_text = (
         f"Missing executive: {dq['missing_executive']:,}  ·  Missing technician: {dq['missing_technician']:,}\n"
         f"Missing ticket ID: {dq['missing_ticket_number']:,}  ·  Extra source rows: {dq['rows_beyond_distinct_tickets']:,}\n"
-        f"Excluded: {dq['soft_closed_tickets_excluded']:,} soft-closed + {dq['negative_response_tickets_excluded']:,} negative-response"
+        f"Excluded: {dq['soft_closed_tickets_excluded']:,} soft-closed + {dq['negative_response_tickets_excluded']:,} negative-response ticket(s)"
     )
-    fig.text(0.675, 0.199, textwrap.fill(dq_text, width=57), fontsize=7.3, color=ink, va="top", linespacing=1.3)
+    fig.text(0.675, 0.199, dq_text, fontsize=7.7, color=ink, va="top", linespacing=1.30)
     reg = analysis["registered_count"]
     if reg is not None:
         reg_line = f"Calls registered: {reg:,} distinct tickets ({analysis['registered_date_coverage']})."
         if analysis["closed_count"] is not None:
             reg_line += f" Closure timestamps: {analysis['closed_count']:,}."
     else:
-        reg_line = "Calls registered for selected date: unavailable from the uploaded report period or scope."
-    fig.text(0.675, 0.119, textwrap.fill(reg_line, width=57), fontsize=7.2, color=muted, va="top", linespacing=1.25)
-    fig.text(0.96, 0.020, "INTERNAL WORKING REPORT  ·  Verify source coverage before formal management circulation",
-             ha="right", va="center", fontsize=7.4, color="#435365")
+        reg_line = "Calls registered for selected date: unavailable from uploaded report period."
+    reg_line = textwrap.fill(reg_line, width=61)
+    fig.text(0.675, 0.126, reg_line, fontsize=7.5, color=muted, va="top", linespacing=1.25)
+
+    fig.text(0.96, 0.020,
+             "INTERNAL WORKING REPORT  ·  Verify source coverage before formal management circulation",
+             ha="right", va="center", fontsize=7.5, color="#435365")
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
     plt.close(fig)
     return buf.getvalue()
-
-
 def make_pdf(priority_png: bytes, management_png: bytes) -> bytes:
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.utils import ImageReader
