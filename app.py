@@ -277,7 +277,7 @@ st.markdown(
 st.markdown(
     """
     <div class="upload-title"><span class="upload-symbol">↑</span> Upload your reports</div>
-    <div class="upload-subtitle">Select one or more hourly Excel exports. Supporting call and customer feedback reports can be included too.</div>
+    <div class="upload-subtitle">Select one or more hourly Excel exports. Supporting Soft Closure and customer feedback reports can be included too.</div>
     """,
     unsafe_allow_html=True,
 )
