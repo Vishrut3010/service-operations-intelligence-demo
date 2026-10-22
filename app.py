@@ -9,7 +9,7 @@ import streamlit as st
 import matplotlib
 matplotlib.use("Agg")
 
-from service_ops_engine import analyze_reports, parse_report, make_management_png, make_priority_png
+from service_ops_engine import analyze_reports, parse_report, make_management_png, make_priority_png, scope_analysis
 
 APP_TITLE = "Service Operations Intelligence"
 
@@ -254,6 +254,26 @@ st.markdown(
         background: #4E9A70;
         box-shadow: 0 0 0 4px rgba(78,154,112,.12);
       }
+      [data-testid="stTabs"] [data-baseweb="tab-list"] {
+        gap: 8px;
+        border-bottom: 1px solid #D9E0E5;
+      }
+      [data-testid="stTabs"] button[role="tab"] {
+        color: #46525B !important;
+        font-family: var(--body-sans) !important;
+        font-weight: 750 !important;
+        border-radius: 9px 9px 0 0;
+        padding: 10px 14px;
+      }
+      [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {
+        color: #C93642 !important;
+        border-bottom: 3px solid #C93642 !important;
+        background: rgba(201,54,66,.045) !important;
+      }
+      [data-testid="stSelectbox"] label {
+        color: #253846 !important;
+        font-weight: 750 !important;
+      }
       @media (max-width: 560px) {
         [data-testid="stMain"] .block-container { padding-left: 1rem; padding-right: 1rem; }
         .hero { padding: 20px 16px; gap: 13px; min-height: 126px; }
@@ -328,6 +348,49 @@ def parse_uploaded_files(files) -> tuple[list[dict], list[str]]:
         except Exception as exc:
             errors.append(f"{file.name}: {exc}")
     return reports, errors
+def safe_filename(value: str) -> str:
+    import re
+    text = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value)).strip("_")
+    return text[:70] or "selected"
+
+
+def render_outputs(view_analysis: dict, view_key: str, name_suffix: str = "") -> None:
+    if view_analysis["current_unique_tickets"] <= 0:
+        st.info("No active pending calls match this selection. Try another franchise or executive.")
+        return
+    try:
+        priority_png = make_priority_png(view_analysis)
+        management_png = make_management_png(view_analysis)
+    except Exception as exc:
+        st.error(f"Could not generate this view. Details: {exc}")
+        return
+    st.markdown(
+        '<div class="ready-line"><span class="ready-dot"></span> Your reports are ready to download</div>',
+        unsafe_allow_html=True,
+    )
+    left, right = st.columns(2, gap="medium")
+    with left:
+        st.download_button(
+            label="↓  Oldest Pending Calls Photo",
+            data=priority_png,
+            file_name=f"Oldest_Pending_Calls_{view_key}{name_suffix}_{view_analysis['analysis_date'].isoformat()}.png",
+            mime="image/png",
+            use_container_width=True,
+            type="primary",
+            key=f"download_priority_{view_key}_{name_suffix}",
+        )
+    with right:
+        st.download_button(
+            label="↓  Management Summary Photo",
+            data=management_png,
+            file_name=f"Management_Summary_{view_key}{name_suffix}_{view_analysis['analysis_date'].isoformat()}.png",
+            mime="image/png",
+            use_container_width=True,
+            type="primary",
+            key=f"download_management_{view_key}_{name_suffix}",
+        )
+
+
 if uploaded:
     reports, errors = parse_uploaded_files(uploaded)
 
@@ -345,38 +408,70 @@ if uploaded:
         analysis_date = latest_report["snapshot_dt"].date()
 
         try:
-            with st.spinner("Creating your reports…"):
-                analysis = analyze_reports(reports, analysis_date)
-                priority_png = make_priority_png(analysis)
-                management_png = make_management_png(analysis)
+            with st.spinner("Analysing uploaded reports…"):
+                base_analysis = analyze_reports(reports, analysis_date)
         except Exception as exc:
-            st.error(f"Could not generate the reports. Check the uploaded file formats and try again. Details: {exc}")
+            st.error(f"Could not analyse the reports. Check the uploaded file formats and try again. Details: {exc}")
             st.stop()
 
-        st.markdown(
-            '<div class="ready-line"><span class="ready-dot"></span> Your reports are ready to download</div>',
-            unsafe_allow_html=True,
-        )
-        left, right = st.columns(2, gap="medium")
-        with left:
-            st.download_button(
-                label="↓  Oldest Pending Calls Photo",
-                data=priority_png,
-                file_name=f"Oldest_Pending_Calls_{analysis_date.isoformat()}.png",
-                mime="image/png",
-                use_container_width=True,
-                type="primary",
-            )
-        with right:
-            st.download_button(
-                label="↓  Management Summary Photo",
-                data=management_png,
-                file_name=f"Management_Summary_{analysis_date.isoformat()}.png",
-                mime="image/png",
-                use_container_width=True,
-                type="primary",
-            )
+        active_queue = base_analysis["priorities"]
+        franchise_col = "Franchise Name" if "Franchise Name" in active_queue.columns else None
+        executive_col = "Service Executive Name" if "Service Executive Name" in active_queue.columns else None
+        franchise_options = sorted(
+            {str(v).strip() for v in active_queue[franchise_col].tolist() if str(v).strip() and str(v).strip().lower() not in {"nan", "none"}},
+            key=str.casefold,
+        ) if franchise_col else []
+        executive_options = sorted(
+            {str(v).strip() for v in active_queue[executive_col].tolist() if str(v).strip() and str(v).strip().lower() not in {"nan", "none"}},
+            key=str.casefold,
+        ) if executive_col else []
+
+        branch_tab, franchise_tab, executive_tab = st.tabs(["Branch-wide", "Franchise-wise", "Executive-wise"])
+
+        with branch_tab:
+            st.caption("All eligible active pending tickets for the branch. Calls are ordered only by Days Old, oldest first.")
+            render_outputs(scope_analysis(base_analysis, "branch"), "branch")
+
+        with franchise_tab:
+            st.caption("Select one franchise to generate a shareable update for its franchise group.")
+            if not franchise_options:
+                st.warning("No franchise names were found in the active pending-call report.")
+            else:
+                selected_franchise = st.selectbox(
+                    "Select franchise", franchise_options, key="selected_franchise", label_visibility="visible"
+                )
+                try:
+                    franchise_analysis = scope_analysis(base_analysis, "franchise", selected_franchise)
+                    st.caption(
+                        f"{franchise_analysis['current_unique_tickets']:,} active pending tickets · "
+                        f"{franchise_analysis['scope_summary']['aged_over_2']:,} aged over 2 days · "
+                        f"{franchise_analysis['scope_summary']['aged_7_plus']:,} aged 7+ days"
+                    )
+                    render_outputs(franchise_analysis, "franchise", safe_filename(selected_franchise))
+                except Exception as exc:
+                    st.error(f"Could not generate the selected franchise view. Details: {exc}")
+
+        with executive_tab:
+            st.caption("Select your name to generate a personal view across all franchises assigned to you.")
+            if not executive_options:
+                st.warning("No service executive names were found in the active pending-call report.")
+            else:
+                selected_executive = st.selectbox(
+                    "Select service executive", executive_options, key="selected_executive", label_visibility="visible"
+                )
+                try:
+                    executive_analysis = scope_analysis(base_analysis, "executive", selected_executive)
+                    exec_franchises = executive_analysis["franchise_summary"]
+                    franchise_count = int(exec_franchises["Franchise"].nunique()) if not exec_franchises.empty and "Franchise" in exec_franchises.columns else 0
+                    st.caption(
+                        f"{executive_analysis['current_unique_tickets']:,} active pending tickets across "
+                        f"{franchise_count:,} franchise(s) · "
+                        f"{executive_analysis['scope_summary']['aged_7_plus']:,} aged 7+ days"
+                    )
+                    render_outputs(executive_analysis, "executive", safe_filename(selected_executive))
+                except Exception as exc:
+                    st.error(f"Could not generate the selected executive view. Details: {exc}")
     elif reports:
-        st.warning("Please include at least one Pending Calls report. Supporting reports can be uploaded with it.")
+        st.warning("Please include at least one Pending Calls report. Supporting Soft Closure and Customer Satisfaction reports can be uploaded with it.")
     elif not errors:
         st.info("No supported report format was detected. Please check the uploaded files.")
