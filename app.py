@@ -330,6 +330,83 @@ st.markdown(
         div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] { padding: 8px 5px !important; min-height: 42px !important; }
         div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] p { font-size: 11px !important; }
       }
+      /* Strong, DOM-version-independent tab styles. In Streamlit, data-baseweb="radio"
+         usually belongs to a wrapper DIV, not the label itself; style both structures. */
+      div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"] {
+        flex: 1 1 0 !important;
+        min-width: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: 0 !important;
+        background: transparent !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"] label,
+      div[data-testid="stRadio"] div[role="radiogroup"] > label,
+      div[data-testid="stRadio"] div[role="radiogroup"] label {
+        box-sizing: border-box !important;
+        width: 100% !important;
+        min-height: 48px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        margin: 0 !important;
+        padding: 10px 14px !important;
+        border: 1px solid #CFD7DE !important;
+        border-radius: 10px !important;
+        background: #FFFFFF !important;
+        color: #20384B !important;
+        -webkit-text-fill-color: #20384B !important;
+        opacity: 1 !important;
+        cursor: pointer !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] label *,
+      div[data-testid="stRadio"] div[role="radiogroup"] label p,
+      div[data-testid="stRadio"] div[role="radiogroup"] label span,
+      div[data-testid="stRadio"] div[role="radiogroup"] label div,
+      div[data-testid="stRadio"] div[role="radiogroup"] label [data-testid="stMarkdownContainer"] {
+        color: #20384B !important;
+        -webkit-text-fill-color: #20384B !important;
+        opacity: 1 !important;
+        text-shadow: none !important;
+        font-weight: 800 !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"]:has(input:checked) label,
+      div[data-testid="stRadio"] div[role="radiogroup"] label:has(input:checked),
+      div[data-testid="stRadio"] div[role="radiogroup"] label[aria-checked="true"] {
+        background: #253846 !important;
+        border-color: #253846 !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+        box-shadow: 0 3px 9px rgba(37,56,70,.16) !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"]:has(input:checked) label *,
+      div[data-testid="stRadio"] div[role="radiogroup"] label:has(input:checked) *,
+      div[data-testid="stRadio"] div[role="radiogroup"] label[aria-checked="true"] * {
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] label:hover:not(:has(input:checked)) {
+        background: #FFF1F2 !important;
+        border-color: #C93642 !important;
+        color: #A82732 !important;
+        -webkit-text-fill-color: #A82732 !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] label:hover:not(:has(input:checked)) * {
+        color: #A82732 !important;
+        -webkit-text-fill-color: #A82732 !important;
+      }
+      div[data-testid="stRadio"] div[role="radiogroup"] label p {
+        margin: 0 !important;
+        font-size: 14px !important;
+        line-height: 1.25 !important;
+        white-space: normal !important;
+        text-align: center !important;
+      }
+      @media (max-width: 760px) {
+        div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"] label,
+        div[data-testid="stRadio"] div[role="radiogroup"] label { padding: 8px 5px !important; min-height: 43px !important; }
+        div[data-testid="stRadio"] div[role="radiogroup"] label p { font-size: 11px !important; }
+      }
     </style>
     <div class="hero">
       <img class="brand-logo" src="IFB_LOGO_HTML_PLACEHOLDER" alt="IFB — Set yourself free" />
