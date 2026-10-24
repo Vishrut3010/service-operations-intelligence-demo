@@ -664,6 +664,11 @@ elif view_choice == "Franchise-wise":
                     f"{franchise_analysis['scope_summary']['aged_over_2']:,} aged over 2 days · "
                     f"{franchise_analysis['scope_summary']['aged_7_plus']:,} aged 7+ days"
                 )
+                st.caption(
+                    f"Service Ambassador productivity is for {franchise_analysis['analysis_date']:%d %b %Y} only. "
+                    "If the Soft Closure report is cumulative, records from every other date are ignored; "
+                    "only distinct resolved/closed tickets with a valid closure timestamp on this date count."
+                )
                 render_outputs(franchise_analysis, "franchise", safe_filename(selected_franchise))
             except Exception as exc:
                 st.error(f"Could not generate the selected franchise view ({type(exc).__name__}). Try clearing/re-uploading the source reports, or check the app logs for details.")
