@@ -455,13 +455,8 @@ def parse_uploaded_files(files) -> tuple[list[dict], list[str]]:
             errors.append(f"{file.name}: {exc}")
     return reports, errors
 @st.cache_data(show_spinner=False, max_entries=4)
-def cached_load_and_analyze(file_items: tuple[tuple[str, bytes], ...]):
-    """Parse and analyse a particular set of uploaded files once per content hash.
-
-    Streamlit reruns the script when a tab selector or dropdown changes. Caching this
-    expensive step prevents the whole multi-thousand-row workbook from being reconciled
-    again for every selected executive or franchise.
-    """
+def cached_parse_reports(file_items: tuple[tuple[str, bytes], ...]):
+    """Parse each uploaded file once; date selection and view changes reuse the result."""
     reports: list[dict] = []
     errors: list[str] = []
     for idx, (filename, raw) in enumerate(file_items):
@@ -473,32 +468,73 @@ def cached_load_and_analyze(file_items: tuple[tuple[str, bytes], ...]):
             reports.append(parsed)
         except Exception as exc:
             errors.append(f"{filename}: {type(exc).__name__}: {exc}")
+    return reports, errors
 
-    pending_reports = [r for r in reports if r["report_type"] == "pending_calls"]
-    if reports and pending_reports:
-        latest_report = max(pending_reports, key=lambda r: (r["snapshot_dt"], r["upload_order"]))
-        analysis_date = latest_report["snapshot_dt"].date()
-        try:
-            base_analysis = analyze_reports(reports, analysis_date)
-            status_message = ""
-        except Exception as exc:
-            base_analysis = None
-            status_message = (
-                "Could not analyse the reports. Check the uploaded file formats and try again. "
-                f"Details: {type(exc).__name__}: {exc}"
-            )
-    elif reports:
-        base_analysis = None
-        status_message = (
-            "Files were uploaded, but no Pending Calls report was detected. Please include a Pending Calls report; "
-            "Soft Closure and Customer Satisfaction files are supporting reports."
-        )
-    elif errors:
-        base_analysis = None
-        status_message = "None of the uploaded files could be read. Check the file formats and try again."
+
+def report_period_end_date(report: dict):
+    end = report.get("period_end")
+    if end is not None and not pd.isna(end):
+        return pd.Timestamp(end).date()
+    return pd.Timestamp(report.get("snapshot_dt")).date()
+
+
+def has_reliable_export_timestamp(report: dict) -> bool:
+    return str(report.get("snapshot_source", "")).strip().lower() == "timestamp in filename"
+
+
+def report_choice_label(report: dict) -> str:
+    period_start = report.get("period_start")
+    period_end = report.get("period_end")
+    if period_start is not None and period_end is not None:
+        period_text = f"{pd.Timestamp(period_start):%d %b} – {pd.Timestamp(period_end):%d %b %Y}"
     else:
+        period_text = f"Period not embedded · {report_period_end_date(report):%d %b %Y} inferred from export/upload"
+    if has_reliable_export_timestamp(report):
+        time_text = f"exported {pd.Timestamp(report['snapshot_dt']):%d %b %Y %H:%M:%S}"
+    else:
+        time_text = "export time not present in filename"
+    return f"{report['filename']} · {period_text} · {time_text} · {report.get('rows', 0):,} rows"
+
+
+def latest_candidates_for_type(reports: list[dict], report_type: str, cutoff_date=None):
+    """Return best automatic choice, latest-date candidates and ambiguity flag."""
+    eligible = [r for r in reports if r.get("report_type") == report_type and
+                (cutoff_date is None or report_period_end_date(r) <= cutoff_date)]
+    if not eligible:
+        return None, [], False
+    latest_date = max(report_period_end_date(r) for r in eligible)
+    candidates = [r for r in eligible if report_period_end_date(r) == latest_date]
+    if len(candidates) == 1:
+        return candidates[0], candidates, False
+    # If every candidate has a real filename timestamp and those timestamps differ,
+    # choose the newest timestamp automatically. Date-range-end placeholders and upload
+    # times are not treated as reliable export timestamps.
+    all_precise = all(has_reliable_export_timestamp(r) for r in candidates)
+    distinct_timestamps = len({str(r.get("snapshot_dt")) for r in candidates}) == len(candidates)
+    if all_precise and distinct_timestamps:
+        chosen = max(candidates, key=lambda r: pd.Timestamp(r["snapshot_dt"]))
+        return chosen, candidates, False
+    # Same reporting end date with missing/identical export time is genuinely ambiguous.
+    # Require a human choice instead of relying on upload order or row count.
+    default = sorted(candidates, key=lambda r: (str(r.get("filename", "")).casefold(), int(r.get("upload_order", 0))))[0]
+    return default, candidates, True
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_analyze_selected(file_items: tuple[tuple[str, bytes], ...],
+                           selected_orders_tuple: tuple[tuple[str, int], ...],
+                           analysis_date_text: str):
+    reports, errors = cached_parse_reports(file_items)
+    selected_orders = {str(k): int(v) for k, v in selected_orders_tuple}
+    try:
+        from datetime import date as _date
+        base_analysis = analyze_reports(reports, _date.fromisoformat(analysis_date_text),
+                                        selected_report_orders=selected_orders)
+        status_message = ""
+    except Exception as exc:
         base_analysis = None
-        status_message = "Upload at least one Pending Calls report above to populate these views."
+        status_message = ("Could not analyse the reports. Check the uploaded file formats and try again. "
+                          f"Details: {type(exc).__name__}: {exc}")
     return reports, errors, base_analysis, status_message
 
 
@@ -577,27 +613,169 @@ def render_outputs(view_analysis: dict, view_key: str, name_suffix: str = "") ->
 
 
 
-# Show a persistent tab-style single-view selector. Rendering only the selected mode
-# avoids expensive hidden-view calculations and prevents cross-view element collisions.
+# Detect report periods first, then automatically choose the most recent compatible report.
+# A user is asked to confirm only when multiple latest candidates cannot be ordered by a
+# reliable filename timestamp.
 reports: list[dict] = []
 errors: list[str] = []
 base_analysis = None
 status_message = "Upload at least one Pending Calls report above to populate these views. Supporting Soft Closure and Customer Satisfaction reports can be uploaded alongside it."
+report_selection_orders: dict[str, int] = {}
+selected_analysis_date = None
+period_ambiguities: list[tuple[str, list[dict], int]] = []
+file_items: tuple[tuple[str, bytes], ...] = tuple()
+upload_fingerprint = "no_upload"
 
 if uploaded:
-    # Cache the full parse + analysis by uploaded file content. This is important because
-    # Streamlit reruns on selector changes; analysis must not rerun for every view click.
     file_items = tuple((file.name, file.getvalue()) for file in uploaded)
-    # Small content fingerprint also keys generated-image caching. Hash each file once
-    # per Streamlit rerun to ensure new uploads never reuse stale images.
     digest = hashlib.sha256()
     for filename, raw in file_items:
         digest.update(filename.encode("utf-8", errors="replace"))
         digest.update(len(raw).to_bytes(8, "big"))
         digest.update(hashlib.sha256(raw).digest())
-    st.session_state["_upload_fingerprint"] = digest.hexdigest()
-    with st.spinner("Checking reports…"):
-        reports, errors, base_analysis, status_message = cached_load_and_analyze(file_items)
+    upload_fingerprint = digest.hexdigest()
+    st.session_state["_upload_fingerprint"] = upload_fingerprint
+
+    with st.spinner("Reading report dates and identifying the latest versions…"):
+        reports, errors = cached_parse_reports(file_items)
+
+    pending_auto, pending_candidates, pending_ambiguous = latest_candidates_for_type(reports, "pending_calls")
+    if pending_auto is not None:
+        selected_pending = pending_auto
+        if pending_ambiguous:
+            with st.container(border=True):
+                st.warning("More than one Pending Calls file ends on the latest report date, and the export time is not reliable enough to order them. Choose the snapshot to use for the current backlog.")
+                order_options = [int(r["upload_order"]) for r in pending_candidates]
+                option_map = {int(r["upload_order"]): r for r in pending_candidates}
+                selected_order = st.selectbox(
+                    "Confirm current Pending Calls snapshot",
+                    options=order_options,
+                    index=order_options.index(int(pending_auto["upload_order"])),
+                    format_func=lambda order: report_choice_label(option_map[order]),
+                    key=f"period_pending_{upload_fingerprint[:10]}",
+                )
+                selected_pending = option_map[int(selected_order)]
+                report_selection_orders["pending_calls"] = int(selected_order)
+                period_ambiguities.append(("pending_calls", pending_candidates, int(selected_order)))
+        else:
+            report_selection_orders["pending_calls"] = int(selected_pending["upload_order"])
+
+        selected_analysis_date = report_period_end_date(selected_pending)
+        selected_snapshot_label = (
+            pd.Timestamp(selected_pending["snapshot_dt"]).strftime("%d %b %Y, %H:%M:%S")
+            if has_reliable_export_timestamp(selected_pending) else "export time not embedded"
+        )
+        st.caption(
+            f"Reporting period: {selected_analysis_date:%d %b %Y} · "
+            f"Pending Calls snapshot: {selected_snapshot_label}"
+        )
+        # Pick the latest available version of each supporting report as of the chosen
+        # pending snapshot's report date. Keep all older files loaded for comparisons.
+        type_labels = {
+            "customer_satisfaction": "Customer Satisfaction",
+            "calls_registered": "Calls Registered",
+            "soft_closure": "Soft Closure / Productivity",
+        }
+        supporting_choices = {}
+        for report_type, label in type_labels.items():
+            auto_choice, candidates, ambiguous = latest_candidates_for_type(reports, report_type, selected_analysis_date)
+            if auto_choice is None:
+                continue
+            chosen = auto_choice
+            if ambiguous:
+                supporting_choices[report_type] = (label, candidates, auto_choice)
+            else:
+                report_selection_orders[report_type] = int(chosen["upload_order"])
+
+        if supporting_choices:
+            with st.container(border=True):
+                st.warning("Some supporting report versions share the same latest reporting date without a reliable export timestamp. Confirm which version should feed the summary.")
+                for report_type, (label, candidates, default_choice) in supporting_choices.items():
+                    order_options = [int(r["upload_order"]) for r in candidates]
+                    option_map = {int(r["upload_order"]): r for r in candidates}
+                    selected_order = st.selectbox(
+                        f"Select {label} report",
+                        options=order_options,
+                        index=order_options.index(int(default_choice["upload_order"])),
+                        format_func=lambda order, m=option_map: report_choice_label(m[order]),
+                        key=f"period_{report_type}_{upload_fingerprint[:10]}",
+                    )
+                    report_selection_orders[report_type] = int(selected_order)
+                    period_ambiguities.append((report_type, candidates, int(selected_order)))
+
+        # Surface a compact manifest so users can see what was detected and which files
+        # the tool is using. Historical Pending Call snapshots remain available for movement analysis.
+        selected_order_values = set(report_selection_orders.values())
+        manifest_rows = []
+        for report in sorted(reports, key=lambda r: (r.get("report_type", ""), report_period_end_date(r), int(r.get("upload_order", 0)))):
+            rtype = report.get("report_type", "unknown")
+            if int(report.get("upload_order", -1)) in selected_order_values:
+                role = ("Selected for productivity; all closure files remain available for reconciliation"
+                        if rtype == "soft_closure" else "Selected for current summary")
+            elif rtype == "pending_calls" and report_period_end_date(report) < selected_analysis_date:
+                role = "Earlier snapshot retained for comparison"
+            elif rtype == "pending_calls" and report_period_end_date(report) == selected_analysis_date:
+                if (has_reliable_export_timestamp(report) and has_reliable_export_timestamp(selected_pending)
+                        and pd.Timestamp(report["snapshot_dt"]) < pd.Timestamp(selected_pending["snapshot_dt"])):
+                    role = "Earlier same-day snapshot retained for comparison"
+                else:
+                    role = "Same-date alternative; not treated as an earlier snapshot"
+            elif report_period_end_date(report) > selected_analysis_date:
+                role = "After selected report date; not used for current summary"
+            else:
+                role = "Available as historical/supporting data"
+            start, end = report.get("period_start"), report.get("period_end")
+            period = (f"{pd.Timestamp(start):%d %b %Y} – {pd.Timestamp(end):%d %b %Y}"
+                      if start is not None and end is not None else f"{report_period_end_date(report):%d %b %Y} (inferred)")
+            export_time = (pd.Timestamp(report["snapshot_dt"]).strftime("%d %b %Y %H:%M:%S")
+                           if has_reliable_export_timestamp(report) else "Not embedded")
+            manifest_rows.append({
+                "Report type": type_labels.get(rtype, {"pending_calls": "Pending Calls"}.get(rtype, rtype.replace("_", " ").title())),
+                "File": report.get("filename", ""), "Reporting period": period,
+                "Export timestamp": export_time, "Rows": int(report.get("rows", 0)), "Selection": role,
+            })
+        expanded_manifest = bool(period_ambiguities)
+        with st.expander("Detected reporting periods", expanded=expanded_manifest):
+            st.caption(
+                f"Current backlog date: {selected_analysis_date:%d %b %Y}. "
+                "The latest eligible report is selected automatically when its date/order is clear. Older Pending Calls snapshots are retained for comparison."
+            )
+            if not has_reliable_export_timestamp(selected_pending):
+                st.info(
+                    "The selected Pending Calls file has no export timestamp in its filename. "
+                    "The report end date is used, but its exact same-day export time cannot be verified."
+                )
+            st.dataframe(pd.DataFrame(manifest_rows), use_container_width=True, hide_index=True)
+
+        # A confirmation is required only for ambiguous selections. On the first upload,
+        # the default choice is shown but no report is generated until the user confirms.
+        selection_key = (
+            upload_fingerprint + "|" + selected_analysis_date.isoformat() + "|" +
+            "|".join(f"{k}:{v}" for k, v in sorted(report_selection_orders.items()))
+        )
+        if period_ambiguities:
+            if st.session_state.get("_confirmed_period_selection") != selection_key:
+                if st.button("Confirm reporting periods and generate reports", type="primary", key="confirm_reporting_periods"):
+                    st.session_state["_confirmed_period_selection"] = selection_key
+                    st.rerun()
+                st.info("Select the correct latest file(s) above, then confirm once. This confirmation appears only because the reporting versions are ambiguous.")
+                status_message = "Confirm the selected reporting periods above to generate the reports."
+            else:
+                with st.spinner("Generating reports for the selected reporting period…"):
+                    reports, errors, base_analysis, status_message = cached_analyze_selected(
+                        file_items, tuple(sorted(report_selection_orders.items())), selected_analysis_date.isoformat()
+                    )
+        else:
+            # Invalidate a prior confirmation if the uploaded file set changed or ambiguity cleared.
+            with st.spinner("Generating reports from the latest detected reporting period…"):
+                reports, errors, base_analysis, status_message = cached_analyze_selected(
+                    file_items, tuple(sorted(report_selection_orders.items())), selected_analysis_date.isoformat()
+                )
+
+    elif reports:
+        status_message = "Files were uploaded, but no Pending Calls report was detected. Please include a Pending Calls report; Soft Closure and Customer Satisfaction files are supporting reports."
+    elif errors:
+        status_message = "None of the uploaded files could be read. Check the file formats and try again."
 
     if errors:
         with st.expander("Some files could not be read"):
@@ -645,8 +823,8 @@ elif view_choice == "Franchise-wise":
                     f"{franchise_analysis['scope_summary']['aged_7_plus']:,} aged 7+ days"
                 )
                 st.caption(
-                    "Service Ambassador productivity counts distinct tickets marked resolved/closed "
-                    "with a valid closure timestamp in the uploaded Soft Closure report period."
+                    "Daily Service Ambassador productivity counts distinct resolved/closed tickets "
+                    "with a valid closure timestamp on the selected report date; target is 6 calls per observed SA."
                 )
                 render_outputs(franchise_analysis, "franchise", safe_filename(selected_franchise))
             except Exception as exc:

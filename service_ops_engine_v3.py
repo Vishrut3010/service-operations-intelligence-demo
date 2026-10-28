@@ -653,17 +653,66 @@ def snapshot_comparison(previous: Optional[Dict[str, Any]], current: Dict[str, A
     }
     return pd.DataFrame(records), counts
 
-def _latest_by_type(reports: List[Dict[str, Any]], report_type: str, on_or_before: Optional[date] = None) -> Optional[Dict[str, Any]]:
+def _report_period_end_date(report: Dict[str, Any]) -> date:
+    """Return the latest date the report claims to cover, distinct from export time."""
+    period_end = report.get("period_end")
+    if period_end is not None and not pd.isna(period_end):
+        return pd.Timestamp(period_end).date()
+    return pd.Timestamp(report.get("snapshot_dt")).date()
+
+
+def _has_precise_export_time(report: Dict[str, Any]) -> bool:
+    """Only a timestamp parsed from the filename is treated as a known export time."""
+    return clean_text(report.get("snapshot_source")).lower() == "timestamp in filename"
+
+
+def _report_sort_key(report: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Sort first by report end date, then by a real export timestamp when available."""
+    end_day = _report_period_end_date(report)
+    if _has_precise_export_time(report):
+        time_key = pd.Timestamp(report.get("snapshot_dt"))
+    else:
+        # This is only an ordering fallback. UI selection warns/asks when this would
+        # compete with another candidate on the same report date.
+        time_key = pd.Timestamp(datetime.combine(end_day, time.max))
+    return (end_day, time_key, int(report.get("upload_order", 0)))
+
+
+def _is_before_report(candidate: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    """Whether a report can safely be treated as an earlier snapshot than current."""
+    candidate_day = _report_period_end_date(candidate)
+    current_day = _report_period_end_date(current)
+    if candidate_day < current_day:
+        return True
+    if candidate_day > current_day:
+        return False
+    # Same-day ordering is reliable only when both reports have true export timestamps.
+    if _has_precise_export_time(candidate) and _has_precise_export_time(current):
+        return pd.Timestamp(candidate.get("snapshot_dt")) < pd.Timestamp(current.get("snapshot_dt"))
+    return False
+
+
+def _latest_by_type(
+    reports: List[Dict[str, Any]],
+    report_type: str,
+    on_or_before: Optional[date] = None,
+    selected_report_orders: Optional[Dict[str, int]] = None,
+) -> Optional[Dict[str, Any]]:
     items = [r for r in reports if r["report_type"] == report_type]
     if on_or_before:
-        bound = pd.Timestamp(datetime.combine(on_or_before, time.max))
-        eligible = [r for r in items if r["snapshot_dt"] <= bound or (r["period_end"] is not None and r["period_end"].date() <= on_or_before)]
+        eligible = [r for r in items if _report_period_end_date(r) <= on_or_before]
+        # If no file ends on/before the selected date, use the latest available file
+        # rather than silently pretending that it covers the selected date.
         if eligible:
             items = eligible
-        elif items:
-            # No older report available; return latest available and let the UI identify its period.
-            pass
-    return sorted(items, key=lambda r: (r["snapshot_dt"], r["upload_order"]))[-1] if items else None
+    if not items:
+        return None
+    selected_order = (selected_report_orders or {}).get(report_type)
+    if selected_order is not None:
+        chosen = [r for r in items if int(r.get("upload_order", -1)) == int(selected_order)]
+        if chosen:
+            return chosen[0]
+    return max(items, key=_report_sort_key)
 
 
 
@@ -707,22 +756,37 @@ def _pendency_reason_outputs(pending_df: pd.DataFrame) -> Tuple[pd.DataFrame, Di
     }
 
 
-def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date] = None) -> Dict[str, Any]:
+def analyze_reports(
+    reports: List[Dict[str, Any]],
+    analysis_date: Optional[date] = None,
+    selected_report_orders: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    selected_report_orders = selected_report_orders or {}
     pending_reports = sorted(
         [r for r in reports if r["report_type"] == "pending_calls"],
-        key=lambda r: (r["snapshot_dt"], r["upload_order"]),
+        key=_report_sort_key,
     )
     if not pending_reports:
         raise ValueError("Upload at least one Pending Call report to generate the oldest-first pending-call list.")
+
+    selected_pending_order = selected_report_orders.get("pending_calls")
+    selected_pending = next(
+        (r for r in pending_reports if selected_pending_order is not None and int(r.get("upload_order", -1)) == int(selected_pending_order)),
+        None,
+    )
     if analysis_date is None:
-        analysis_date = pending_reports[-1]["snapshot_dt"].date()
-    bound = pd.Timestamp(datetime.combine(analysis_date, time.max))
-    eligible_pending = [r for r in pending_reports if r["snapshot_dt"] <= bound]
+        analysis_date = _report_period_end_date(selected_pending or max(pending_reports, key=_report_sort_key))
+    eligible_pending = [r for r in pending_reports if _report_period_end_date(r) <= analysis_date]
     if not eligible_pending:
         raise ValueError("No Pending Call snapshot exists on or before the selected analysis date. Choose a later date or upload an earlier report.")
-    current = eligible_pending[-1]
-    prev_candidates = [r for r in pending_reports if (r["snapshot_dt"], r["upload_order"]) < (current["snapshot_dt"], current["upload_order"])]
-    previous = prev_candidates[-1] if prev_candidates else None
+    if selected_pending is not None and _report_period_end_date(selected_pending) <= analysis_date:
+        current = selected_pending
+    else:
+        current = max(eligible_pending, key=_report_sort_key)
+    # Do not compare two same-date reports when either lacks an actual export time;
+    # their chronological order is unknown. Older dated snapshots remain available.
+    prev_candidates = [r for r in pending_reports if _is_before_report(r, current)]
+    previous = max(prev_candidates, key=_report_sort_key) if prev_candidates else None
 
     current_type_rows = filter_pending_call_types(current["df"])
     current_ticket_df, current_eligible_rows, current_exclusion_stats = active_pending_data(current, reports)
@@ -746,8 +810,8 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
         top20_executive_summary = pd.DataFrame(columns=["Executive", "Top 20 Calls", "Share of Top 20 (%)"])
     comparisons, movement_counts = snapshot_comparison(previous, current, reports)
 
-    csat_report = _latest_by_type(reports, "customer_satisfaction", analysis_date)
-    reg_report = _latest_by_type(reports, "calls_registered", analysis_date)
+    csat_report = _latest_by_type(reports, "customer_satisfaction", analysis_date, selected_report_orders)
+    reg_report = _latest_by_type(reports, "calls_registered", analysis_date, selected_report_orders)
     csat = csat_report["df"].copy() if csat_report else pd.DataFrame()
     registered = reg_report["df"].copy() if reg_report else pd.DataFrame()
 
@@ -814,15 +878,15 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
     # Compare the latest Customer Satisfaction snapshot with the previous available snapshot.
     # Shares show feedback mix; CSS itself uses (Happy - Not Happy) / total nonblank feedback × 100.
     csat_items = sorted(
-        [r for r in reports if r["report_type"] == "customer_satisfaction" and
-         (r["snapshot_dt"] <= bound or (r["period_end"] is not None and r["period_end"].date() <= analysis_date))],
-        key=lambda r: (r["snapshot_dt"], r["upload_order"]),
+        [r for r in reports if r["report_type"] == "customer_satisfaction"
+         and _report_period_end_date(r) <= analysis_date],
+        key=_report_sort_key,
     )
     csat_previous_report = None
     if csat_report is not None:
-        prior_items = [r for r in csat_items if (r["snapshot_dt"], r["upload_order"]) < (csat_report["snapshot_dt"], csat_report["upload_order"])]
+        prior_items = [r for r in csat_items if _is_before_report(r, csat_report)]
         if prior_items:
-            csat_previous_report = prior_items[-1]
+            csat_previous_report = max(prior_items, key=_report_sort_key)
     csat_comparison = pd.DataFrame(columns=["Feedback", "Previous Count", "Current Count", "Count Change", "Previous Share %", "Current Share %", "Share Change (pp)"])
     csat_movement = {"previous_rows": None, "current_rows": len(csat), "new_tickets": None, "missing_tickets": None, "happy_delta_pp": None, "not_happy_delta_pp": None, "css_delta_pp": None}
     if csat_previous_report is not None:
@@ -984,6 +1048,7 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
 
     return {
         "analysis_date": analysis_date,
+        "selected_report_orders": dict(selected_report_orders),
         "reports": reports,
         "pending_reports": pending_reports,
         "current_pending_report": current,
@@ -1090,7 +1155,8 @@ def _simple_counts(df: pd.DataFrame, source_col_aliases: Sequence[str], output_c
 
 
 def _service_ambassador_productivity(
-    reports: List[Dict[str, Any]], franchise_name: str, analysis_date: date
+    reports: List[Dict[str, Any]], franchise_name: str, analysis_date: date,
+    selected_report_order: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, str]:
     """Count distinct completed/soft-closed tickets per technician for a franchise.
 
@@ -1113,7 +1179,8 @@ def _service_ambassador_productivity(
     if not candidates:
         return empty, "No Soft Closure report covers the selected report date."
 
-    report = sorted(candidates, key=lambda r: (r.get("snapshot_dt"), r.get("upload_order", 0)))[-1]
+    chosen = [r for r in candidates if selected_report_order is not None and int(r.get("upload_order", -1)) == int(selected_report_order)]
+    report = chosen[0] if chosen else max(candidates, key=_report_sort_key)
     df = report.get("df", pd.DataFrame()).copy()
     if df.empty:
         return empty, "The selected Soft Closure report contains no rows."
@@ -1144,17 +1211,12 @@ def _service_ambassador_productivity(
         period = report.get("metadata") or f"{analysis_date:%d %b %Y}"
         return empty, f"No resolved/closed calls with valid closure timestamps were found for {period}."
 
-    # Restrict events to the report's declared date range (inclusive by date, as these
-    # exports commonly show midnight as the end-time even for a full-day report).
-    period_start, period_end = report.get("period_start"), report.get("period_end")
-    if period_start is not None and period_end is not None:
-        dates = scoped["_completion_timestamp"].dt.date
-        scoped = scoped.loc[(dates >= period_start.date()) & (dates <= period_end.date())].copy()
-    else:
-        dates = scoped["_completion_timestamp"].dt.date
-        scoped = scoped.loc[dates == analysis_date].copy()
+    # Productivity is strictly daily even when the source workbook is cumulative:
+    # count only completion events whose actual timestamp date equals analysis_date.
+    event_dates = scoped["_completion_timestamp"].dt.date
+    scoped = scoped.loc[event_dates == analysis_date].copy()
     if scoped.empty:
-        return empty, "No completed calls fall inside the Soft Closure report period."
+        return empty, f"No completed calls have a valid closure timestamp on {analysis_date:%d %b %Y}."
 
     # One ticket contributes once. If multiple rows exist, attribute it to the most
     # recent recorded closure event (stable source order for timestamp ties).
@@ -1172,6 +1234,172 @@ def _service_ambassador_productivity(
     summary = summary.sort_values(["Calls Done", "Service Ambassador"], ascending=[False, True], kind="stable").reset_index(drop=True)
     period_label = report.get("metadata") or f"{analysis_date:%d %b %Y}"
     return summary, f"Resolved/soft-closed unique tickets · {period_label}"
+
+
+def _service_ambassador_target_hierarchy(
+    reports: List[Dict[str, Any]],
+    analysis_date: date,
+    pending_roster: pd.DataFrame,
+    scope_mode: str = "branch",
+    selection: str = "",
+    selected_report_order: Optional[int] = None,
+    daily_target: int = 6,
+) -> Tuple[pd.DataFrame, str]:
+    """Build daily SA productivity grouped Executive -> Franchise -> SA.
+
+    Completion counts use distinct tickets with resolved/closed/completed status and a
+    valid closure timestamp on exactly analysis_date. The roster is the union of SAs
+    visible in the scoped active-pending queue and SAs with call activity on that date
+    in the selected Soft Closure report. This is the best roster the available exports
+    support; it is not an attendance register, so no-shows/leave cannot be inferred.
+    """
+    columns = [
+        "Executive", "Franchise", "Service Ambassador", "Calls Done", "Daily Target",
+        "Target Achievement (%)", "Calls Short of Target", "Franchise Calls Done",
+        "Franchise SA Count", "Franchise Target Achievement (%)", "Executive Calls Done",
+        "Executive SA Count", "Executive Target Achievement (%)",
+    ]
+    empty = pd.DataFrame(columns=columns)
+    mode = (scope_mode or "branch").strip().lower()
+    candidates = []
+    for report in reports or []:
+        if report.get("report_type") != "soft_closure":
+            continue
+        start, end = report.get("period_start"), report.get("period_end")
+        if start is not None and end is not None:
+            if start.date() <= analysis_date <= end.date():
+                candidates.append(report)
+        elif pd.Timestamp(report.get("snapshot_dt")).date() == analysis_date:
+            candidates.append(report)
+    if not candidates:
+        return empty, "No Soft Closure report covers the selected date; daily SA target attainment is unavailable."
+    selected = [r for r in candidates if selected_report_order is not None and int(r.get("upload_order", -1)) == int(selected_report_order)]
+    report = selected[0] if selected else max(candidates, key=_report_sort_key)
+    source = report.get("df", pd.DataFrame()).copy()
+    if source.empty:
+        return empty, "The selected Soft Closure report contains no rows."
+
+    ticket_col = get_ticket_col(source)
+    franchise_col = find_col(source, ["Franchise Name", "FrName", "Franchise"])
+    executive_col = find_col(source, ["Branch Exe Name", "Service Executive Name", "Branch Executive Name", "Executive Name"])
+    technician_col = find_col(source, ["Technician Name", "Service Ambassador", "Service Ambassador Name", "Technician"])
+    status_col = find_col(source, ["Status", "Call Status"])
+    if not ticket_col or not franchise_col or not technician_col or not status_col:
+        return empty, "The Soft Closure report needs ticket, franchise, technician and status columns for daily productivity."
+
+    event_col = find_col(source, ["Soft Closure Date", "Soft Closed Date", "SoftClosureDate", "Closure Date"])
+    event_ts = (_valid_datetime_series(source[event_col]) if event_col else
+                pd.Series(pd.NaT, index=source.index, dtype="datetime64[ns]"))
+    closed_col = find_col(source, ["ClosedDate", "Closed Date", "Closed Time", "Closed Timestamp"])
+    if closed_col:
+        event_ts = event_ts.fillna(_valid_datetime_series(source[closed_col]))
+    source["__completion_ts"] = event_ts
+    event_day = source["__completion_ts"].dt.date
+    booking_col = find_col(source, ["Call Book Date", "Call Booking Date", "Booking Date"])
+    booking_ts = (_valid_datetime_series(source[booking_col]) if booking_col else
+                  pd.Series(pd.NaT, index=source.index, dtype="datetime64[ns]"))
+    booking_day = booking_ts.dt.date
+
+    def row_in_scope(frame: pd.DataFrame) -> pd.DataFrame:
+        out = frame
+        if mode == "franchise":
+            col = find_col(out, ["Franchise Name", "FrName", "Franchise"])
+            if col is None:
+                return out.iloc[0:0].copy()
+            out = out.loc[out[col].map(norm) == norm(selection)]
+        elif mode == "executive":
+            col = find_col(out, ["Branch Exe Name", "Service Executive Name", "Branch Executive Name", "Executive Name"])
+            if col is None:
+                return out.iloc[0:0].copy()
+            out = out.loc[out[col].map(norm) == norm(selection)]
+        return out
+
+    # Build an observed SA roster. Add assigned SAs from active pending calls (including
+    # zero-completion SAs), plus people represented in call/closure activity on the date.
+    roster: dict[tuple[str, str, str], dict[str, str]] = {}
+
+    def add_roster(executive: Any, franchise: Any, technician: Any) -> None:
+        ex = clean_text(executive) or "Unspecified executive"
+        fr = clean_text(franchise) or "Unspecified franchise"
+        sa = clean_text(technician)
+        if not sa:
+            return
+        key = (norm(ex), norm(fr), norm(sa))
+        if key not in roster:
+            roster[key] = {"Executive": ex, "Franchise": fr, "Service Ambassador": sa}
+
+    if pending_roster is not None and not pending_roster.empty:
+        roster_exec = find_col(pending_roster, ["Service Executive Name", "Branch Exe Name", "Branch Executive Name", "Executive Name"])
+        roster_fr = find_col(pending_roster, ["Franchise Name", "FrName", "Franchise"])
+        roster_sa = find_col(pending_roster, ["Technician Name", "Service Ambassador", "Service Ambassador Name", "Technician"])
+        if roster_sa:
+            for _, row in pending_roster.iterrows():
+                add_roster(row.get(roster_exec, "") if roster_exec else "",
+                           row.get(roster_fr, "") if roster_fr else "", row.get(roster_sa, ""))
+
+    daily_activity_mask = event_day.eq(analysis_date) | booking_day.eq(analysis_date)
+    daily_activity = row_in_scope(source.loc[daily_activity_mask].copy())
+    for _, row in daily_activity.iterrows():
+        add_roster(row.get(executive_col, "") if executive_col else "",
+                   row.get(franchise_col, ""), row.get(technician_col, ""))
+
+    # Only completions timestamped on the selected date contribute to output.
+    status = source[status_col].map(norm)
+    complete_mask = status.map(lambda v: ("resolved" in v) or ("closed" in v) or ("completed" in v))
+    completion_rows = source.loc[complete_mask & event_day.eq(analysis_date)].copy()
+    completion_rows = row_in_scope(completion_rows)
+    if not completion_rows.empty:
+        call_type_col = find_col(completion_rows, ["Call Type", "CallType"])
+        if call_type_col:
+            completion_rows = completion_rows.loc[~excluded_pending_call_type_mask(completion_rows)].copy()
+        completion_rows["__ticket_key"] = completion_rows[ticket_col].map(clean_text)
+        completion_rows["__executive"] = completion_rows[executive_col].map(lambda v: clean_text(v) or "Unspecified executive") if executive_col else "Unspecified executive"
+        completion_rows["__franchise"] = completion_rows[franchise_col].map(lambda v: clean_text(v) or "Unspecified franchise")
+        completion_rows["__sa"] = completion_rows[technician_col].map(lambda v: clean_text(v) or "Unspecified SA")
+        completion_rows = completion_rows.loc[completion_rows["__ticket_key"].ne("")].sort_values("__completion_ts", kind="stable")
+        # One ticket is one completion. For duplicates, assign to the latest event row.
+        completion_rows = completion_rows.drop_duplicates(subset=["__ticket_key"], keep="last")
+        for _, row in completion_rows.iterrows():
+            add_roster(row["__executive"], row["__franchise"], row["__sa"])
+
+    if not roster:
+        return empty, "No Service Ambassador names were available from the uploaded reports for this view."
+
+    done_counts: dict[tuple[str, str, str], int] = {}
+    if not completion_rows.empty:
+        for _, row in completion_rows.iterrows():
+            key = (norm(row["__executive"]), norm(row["__franchise"]), norm(row["__sa"]))
+            done_counts[key] = done_counts.get(key, 0) + 1
+
+    rows = []
+    for key, names in roster.items():
+        rows.append({**names, "Calls Done": int(done_counts.get(key, 0)), "Daily Target": int(daily_target)})
+    result = pd.DataFrame(rows)
+    result["Target Achievement (%)"] = (result["Calls Done"] * 100.0 / daily_target).round(1)
+    result["Calls Short of Target"] = (daily_target - result["Calls Done"]).clip(lower=0).astype(int)
+
+    # Add franchise and executive roll-ups; this is a ratio of total calls to total SA targets,
+    # not an unweighted average of individual percentages.
+    fr_roll = result.groupby(["Executive", "Franchise"], dropna=False).agg(
+        **{"Franchise Calls Done": ("Calls Done", "sum"), "Franchise SA Count": ("Service Ambassador", "nunique")}
+    ).reset_index()
+    fr_roll["Franchise Target Achievement (%)"] = (
+        fr_roll["Franchise Calls Done"] / (fr_roll["Franchise SA Count"] * daily_target).replace(0, pd.NA) * 100
+    ).fillna(0).round(1)
+    ex_roll = result.groupby("Executive", dropna=False).agg(
+        **{"Executive Calls Done": ("Calls Done", "sum"), "Executive SA Count": ("Service Ambassador", "count")}
+    ).reset_index()
+    ex_roll["Executive Target Achievement (%)"] = (
+        ex_roll["Executive Calls Done"] / (ex_roll["Executive SA Count"] * daily_target).replace(0, pd.NA) * 100
+    ).fillna(0).round(1)
+    result = result.merge(fr_roll, on=["Executive", "Franchise"], how="left").merge(ex_roll, on="Executive", how="left")
+    result = result.sort_values(["Executive", "Franchise", "Calls Done", "Service Ambassador"],
+                                ascending=[True, True, False, True], kind="stable").reset_index(drop=True)
+    note = (f"Daily completed distinct tickets on {analysis_date:%d %b %Y}; target = {daily_target} calls per observed SA. "
+            "Observed SA roster comes from active pending assignments and the selected day's report activity; attendance/leave data is not available.")
+    if completion_rows.empty:
+        note = f"No completed tickets with a valid closure timestamp were recorded on {analysis_date:%d %b %Y}; target attainment shown as 0% for observed SAs. Attendance/leave data is not available."
+    return result[columns], note
 
 
 def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selection: str = "") -> Dict[str, Any]:
@@ -1375,11 +1603,21 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
     else:
         scoped["technician_summary"] = pd.DataFrame(columns=["Technician", "Pending Tickets", "Aged >2 Days", "Aged 7+ Days"])
 
-    # Franchise-specific output: count completed calls by service ambassador from the
-    # uploaded Soft Closure report, separately from current pending workload.
+    # Daily Service Ambassador output is scoped consistently in all three views.
+    # It uses exact completion dates and the six-call daily mandate.
+    productivity_hierarchy, productivity_hierarchy_note = _service_ambassador_target_hierarchy(
+        analysis.get("reports", []), analysis.get("analysis_date", date.today()), priorities,
+        scope_mode=mode, selection=clean_text(selection),
+        selected_report_order=analysis.get("selected_report_orders", {}).get("soft_closure"),
+        daily_target=6,
+    )
+    scoped["sa_productivity_hierarchy"] = productivity_hierarchy
+    scoped["sa_productivity_hierarchy_note"] = productivity_hierarchy_note
+
     if mode == "franchise":
         productivity, productivity_note = _service_ambassador_productivity(
-            analysis.get("reports", []), clean_text(selection), analysis.get("analysis_date", date.today())
+            analysis.get("reports", []), clean_text(selection), analysis.get("analysis_date", date.today()),
+            selected_report_order=analysis.get("selected_report_orders", {}).get("soft_closure"),
         )
         scoped["service_ambassador_productivity"] = productivity
         scoped["service_ambassador_productivity_note"] = productivity_note
@@ -1742,8 +1980,8 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
             ax.text(val + xmax * 0.025, yy, f"{int(val):,}  ·  {share:.1f}%", va="center", ha="left",
                     fontsize=7.3, color=ink, weight="bold")
 
-    # Four evenly spaced panels: age, reasons, view-specific operations, feedback.
-    # White cards and consistent margins reduce visual clutter and prevent text/chart collisions.
+    # Four evenly spaced panels: age, recorded reasons, view-specific operations, SA target attainment.
+    # Feedback mix is removed; OK and Not Happy counts are shown compactly in the footer.
     panels = [(0.04, 0.515, 0.445, 0.265), (0.515, 0.515, 0.445, 0.265),
               (0.04, 0.275, 0.445, 0.220), (0.515, 0.275, 0.445, 0.220)]
     for x, y, w, h in panels:
@@ -1830,9 +2068,11 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     # Panel 3 — context appropriate to the selected view. The branch executive chart remains on the Top 20 image.
     ax_ops = fig.add_axes([0.105, 0.305, 0.345, 0.155])
     if mode == "franchise":
-        productivity_frame = analysis.get("service_ambassador_productivity", pd.DataFrame()).copy()
-        draw_hbar(ax_ops, productivity_frame, "Service Ambassador", "Calls Done",
-                  "Service Ambassador productivity · selected date", "Share (%)", max_rows=5, label_wrap=23)
+        # The separate SA target chart (panel 4) shows completed calls vs the 6/day mandate.
+        # Use this panel for complementary open workload, avoiding two near-identical productivity charts.
+        technician_frame = analysis.get("technician_summary", pd.DataFrame()).copy()
+        draw_hbar(ax_ops, technician_frame, "Technician", "Pending Tickets",
+                  "Open pending workload by technician", max_rows=5, label_wrap=23)
     elif mode == "executive":
         fr_frame = analysis.get("franchise_summary", pd.DataFrame()).copy()
         if len(fr_frame) > 1:
@@ -1847,52 +2087,99 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
             fr_frame = fr_frame.loc[fr_frame["Aged >2 Days"] > 0]
         draw_hbar(ax_ops, fr_frame, "Franchise", "Aged >2 Days", "Franchises with calls aged >2 days", max_rows=5, label_wrap=22)
 
-    # Panel 4 — customer feedback mix, scoped only where the source has a matching franchise/executive field.
-    ax_feedback = fig.add_axes([0.595, 0.305, 0.33, 0.155])
-    csat_summary = analysis.get("csat_summary", pd.DataFrame()).copy()
-    if not csat_summary.empty and {"Feedback", "Share %"}.issubset(csat_summary.columns):
-        order = {"HAPPY": 0, "OK": 1, "NOT HAPPY": 2}
-        csat_summary["_ord"] = csat_summary["Feedback"].map(lambda x: order.get(clean_text(x).upper(), 3))
-        csat_summary = csat_summary.sort_values("_ord", kind="stable")
-        labels = csat_summary["Feedback"].astype(str).str.upper().tolist()
-        vals = pd.to_numeric(csat_summary["Share %"], errors="coerce").fillna(0).to_numpy(dtype=float)
-        color_map = {"HAPPY": green, "OK": amber, "NOT HAPPY": red}
-        bars = ax_feedback.bar(labels, vals, color=[color_map.get(x, "#8A9BA9") for x in labels], width=0.56)
-        feedback_title = "Customer feedback mix" if mode == "branch" else "Customer feedback for this view"
-        style_axis(ax_feedback, feedback_title)
-        ax_feedback.set_ylim(0, max(100.0, float(vals.max()) * 1.18 if len(vals) else 100.0))
-        ax_feedback.tick_params(axis="x", labelsize=7.8, colors=ink, pad=4)
-        ax_feedback.tick_params(axis="y", labelsize=7.2, colors=ink)
-        ax_feedback.grid(axis="x", visible=False)
-        for bar, val in zip(bars, vals):
-            ax_feedback.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1.5, f"{val:.1f}%",
-                             ha="center", va="bottom", fontsize=7.8, color=ink, weight="bold")
+    # Panel 4 — daily SA productivity against the six-call mandate.
+    # Keep individual labels readable. In a single Executive/Franchise scope, show SA names
+    # only and place the parent hierarchy in a subtitle; in a multi-team branch view, attach
+    # parent names only when needed to distinguish repeated SA names.
+    ax_sa = fig.add_axes([0.625, 0.312, 0.300, 0.145])
+    sa_frame = analysis.get("sa_productivity_hierarchy", pd.DataFrame()).copy()
+    sa_note = clean_text(analysis.get("sa_productivity_hierarchy_note", ""))
+    if not sa_frame.empty and {"Executive", "Franchise", "Service Ambassador", "Calls Done"}.issubset(sa_frame.columns):
+        sa_frame["Calls Done"] = pd.to_numeric(sa_frame["Calls Done"], errors="coerce").fillna(0).astype(int)
+        all_sa_frame = sa_frame.copy()
+        sa_frame = sa_frame.sort_values(
+            ["Calls Done", "Executive", "Franchise", "Service Ambassador"],
+            ascending=[False, True, True, True], kind="stable"
+        ).head(6).copy()
+        exec_values = all_sa_frame["Executive"].map(lambda v: clean_text(v) or "Unspecified executive").drop_duplicates().tolist()
+        franchise_values = all_sa_frame["Franchise"].map(lambda v: clean_text(v) or "Unspecified franchise").drop_duplicates().tolist()
+        simple_single_group = len(exec_values) == 1 and len(franchise_values) == 1
+        sa_name_counts = all_sa_frame["Service Ambassador"].map(lambda v: norm(v)).value_counts()
+        labels = []
+        for _, row in sa_frame.iterrows():
+            sa = clean_text(row.get("Service Ambassador", "")) or "Unspecified SA"
+            ex = clean_text(row.get("Executive", "")) or "Unspecified executive"
+            fr = clean_text(row.get("Franchise", "")) or "Unspecified franchise"
+            if simple_single_group or sa_name_counts.get(norm(sa), 0) == 1:
+                labels.append(textwrap.fill(sa, width=22, break_long_words=False))
+            else:
+                labels.append(textwrap.fill(f"{sa} · {fr} · {ex}", width=24, break_long_words=False))
+        values = sa_frame["Calls Done"].to_numpy(dtype=float)
+        y_sa = np.arange(len(sa_frame))
+        ax_sa.barh(y_sa, values, color=blue, height=0.58)
+        ax_sa.set_yticks(y_sa)
+        ax_sa.set_yticklabels(labels, fontsize=7.0, color=ink)
+        ax_sa.invert_yaxis()
+        style_axis(ax_sa, "SA productivity · target 6/day (top 6)", title_size=9.3)
+        ax_sa.tick_params(axis="y", labelsize=7.0, colors=ink, pad=3)
+        xmax = max(6.0, float(values.max()) if len(values) else 6.0)
+        ax_sa.set_xlim(0, xmax * 1.48)
+        ax_sa.axvline(6, color=red, linestyle="--", linewidth=1.0, alpha=0.8)
+        for yy, value, (_, row) in zip(y_sa, values, sa_frame.iterrows()):
+            pct = float(row.get("Target Achievement (%)", 0) or 0)
+            ax_sa.text(value + max(xmax * 0.025, 0.08), yy, f"{int(value)}/6 · {pct:.0f}%",
+                       va="center", ha="left", fontsize=7.0, color=ink, weight="bold")
+        if simple_single_group:
+            hierarchy_label = f"{exec_values[0]}  →  {franchise_values[0]}"
+        else:
+            hierarchy_label = "Grouped by executive → franchise → SA"
+        tail = hierarchy_label
+        ax_sa.text(0.0, -0.15, textwrap.fill(tail, width=48),
+                   transform=ax_sa.transAxes, fontsize=6.4, color=muted, va="top", clip_on=False)
     else:
-        missing_note = ("No matching customer feedback for this view." if mode != "branch" and not analysis.get("csat_scope_supported", True)
-                        else "No Customer Satisfaction report available.")
-        empty_axis(ax_feedback, "Customer feedback mix", missing_note)
+        empty_axis(ax_sa, "SA daily productivity vs 6-call target", sa_note or "Upload a dated Soft Closure report to calculate daily target attainment.")
 
-    # Compact footer: two columns with only the operational context a manager needs.
+    # Compact three-column footer: movement, the requested OK/Not Happy counts, and data notes.
     fig.patches.append(plt.Rectangle((0.04, 0.065), 0.92, 0.165, transform=fig.transFigure,
                                      facecolor="#FFFFFF", edgecolor="#D8E0E7", linewidth=0.9, zorder=0))
     mc = analysis.get("movement_counts", {})
-    fig.text(0.055, 0.202, "SNAPSHOT MOVEMENT", fontsize=8.0, color=teal, weight="bold", va="center")
+    fig.text(0.055, 0.202, "SNAPSHOT MOVEMENT", fontsize=7.8, color=teal, weight="bold", va="center")
     if analysis.get("previous_pending_report"):
-        movement = (f"New: {int(mc.get('new', 0)):,}  ·  Continuing: {int(mc.get('continuing', 0)):,}  ·  "
+        movement = (f"New: {int(mc.get('new', 0)):,} · Continuing: {int(mc.get('continuing', 0)):,} · "
                     f"No longer listed: {int(mc.get('missing', 0)):,}")
     else:
-        movement = "Upload a previous snapshot to compare hourly movement."
-    fig.text(0.055, 0.176, textwrap.fill(movement, width=70), fontsize=8.0, color=ink, va="top")
-    fig.text(0.055, 0.126, "A call absent from a later snapshot is not proof of closure.", fontsize=7.5, color=red, va="top")
+        movement = "Upload an earlier snapshot to compare movement."
+    fig.text(0.055, 0.176, textwrap.fill(movement, width=46), fontsize=7.3, color=ink, va="top")
+    fig.text(0.055, 0.118, "Missing from a later snapshot does not prove closure.", fontsize=6.8, color=red, va="top")
 
-    fig.lines.append(plt.Line2D([0.51, 0.51], [0.085, 0.215], transform=fig.transFigure, color="#E0E6EB", linewidth=0.8))
-    fig.text(0.535, 0.202, "DATA NOTES", fontsize=8.0, color=teal, weight="bold", va="center")
+    fig.lines.append(plt.Line2D([0.345, 0.345], [0.085, 0.215], transform=fig.transFigure, color="#E0E6EB", linewidth=0.8))
+    fig.text(0.365, 0.202, "CUSTOMER FEEDBACK COUNTS", fontsize=7.8, color=teal, weight="bold", va="center")
+    fb_metrics = analysis.get("csat_metrics", {})
+    ok_count = fb_metrics.get("ok")
+    not_happy_count = fb_metrics.get("not_happy")
+    fig.text(0.365, 0.164, f"OK  {int(ok_count):,}" if ok_count is not None else "OK  —",
+             fontsize=11.0, color=amber, weight="bold", va="center")
+    fig.text(0.465, 0.164, f"NOT HAPPY  {int(not_happy_count):,}" if not_happy_count is not None else "NOT HAPPY  —",
+             fontsize=10.0, color=red, weight="bold", va="center")
+    feedback_note = "Counts from the selected feedback report; CSS is shown above."
+    fig.text(0.365, 0.119, textwrap.fill(feedback_note, width=43), fontsize=6.8, color=muted, va="top")
+
+    fig.lines.append(plt.Line2D([0.625, 0.625], [0.085, 0.215], transform=fig.transFigure, color="#E0E6EB", linewidth=0.8))
+    fig.text(0.645, 0.202, "DATA NOTES", fontsize=7.8, color=teal, weight="bold", va="center")
     dq = analysis.get("data_quality_metrics", {})
-    exclude_line = (f"Excluded from active queue: {int(dq.get('soft_closed_tickets_excluded', 0)):,} soft-closed, "
+    exclude_line = (f"Excluded: {int(dq.get('soft_closed_tickets_excluded', 0)):,} soft-closed, "
                     f"{int(dq.get('negative_response_tickets_excluded', 0)):,} negative-response; Courtesy and Dealer Defective excluded.")
-    fig.text(0.535, 0.176, textwrap.fill(exclude_line, width=68), fontsize=7.7, color=ink, va="top")
-    source_line = f"Pending reasons are source-entered; {reason_missing:,} of {reason_all:,} active tickets have no reason recorded."
-    fig.text(0.535, 0.119, textwrap.fill(source_line, width=68), fontsize=7.6, color=muted, va="top")
+    fig.text(0.645, 0.176, textwrap.fill(exclude_line, width=49), fontsize=6.8, color=ink, va="top")
+    sa_all = analysis.get("sa_productivity_hierarchy", pd.DataFrame()).copy()
+    sa_total_done = int(pd.to_numeric(sa_all.get("Calls Done", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sa_all.empty else 0
+    sa_total_target = int(pd.to_numeric(sa_all.get("Daily Target", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not sa_all.empty else 0
+    sa_count = int(sa_all["Service Ambassador"].nunique()) if not sa_all.empty and "Service Ambassador" in sa_all.columns else 0
+    sa_attainment = (100.0 * sa_total_done / sa_total_target) if sa_total_target else None
+    if sa_attainment is not None:
+        source_line = f"SA target: {sa_attainment:.1f}% ({sa_total_done}/{sa_total_target} calls across {sa_count} observed SAs)."
+    else:
+        source_line = "SA target attainment unavailable: no valid daily closure data."
+    fig.text(0.645, 0.119, textwrap.fill(source_line, width=49), fontsize=6.8, color=muted, va="top")
     fig.text(0.96, 0.027, "INTERNAL WORKING REPORT  ·  Snapshot-based figures; validate source coverage", 
              ha="right", va="center", fontsize=7.2, color=muted)
 
