@@ -166,7 +166,21 @@ def parse_report(filename: str, file_bytes: bytes, upload_order: int = 0) -> Dic
     if drop_cols:
         df = df.drop(columns=drop_cols)
     df = df.dropna(how="all").reset_index(drop=True)
-    report_type = _classify(df)
+    # Prefer the report title/filename when an export has overlapping columns.
+    # Soft Closure exports can contain Call Book Date and status fields that overlap
+    # with Calls Registered; relying only on headers can misclassify the closure file,
+    # which then makes the SA productivity graph appear empty.
+    title_hint = norm(metadata + " " + filename)
+    if "softclosure" in title_hint or ("soft" in title_hint and "closure" in title_hint):
+        report_type = "soft_closure"
+    elif "customersatisfaction" in title_hint or "customersatisfaction score" in title_hint:
+        report_type = "customer_satisfaction"
+    elif "callsregistered" in title_hint:
+        report_type = "calls_registered"
+    elif "pendingcall" in title_hint:
+        report_type = "pending_calls"
+    else:
+        report_type = _classify(df)
     if report_type == "unknown":
         raise ValueError("The file was read, but its report type could not be identified. Expected Pending Calls, Calls Registered, Soft Closure, or Customer Satisfaction.")
 
@@ -1248,10 +1262,10 @@ def _service_ambassador_target_hierarchy(
     """Build daily SA productivity grouped Executive -> Franchise -> SA.
 
     Completion counts use distinct tickets with resolved/closed/completed status and a
-    valid closure timestamp on exactly analysis_date. The roster is the union of SAs
-    visible in the scoped active-pending queue and SAs with call activity on that date
-    in the selected Soft Closure report. This is the best roster the available exports
-    support; it is not an attendance register, so no-shows/leave cannot be inferred.
+    valid closure timestamp on exactly analysis_date. The SA roster is derived from dated
+    activity rows in the selected Soft Closure workbook itself, grouped by executive,
+    franchise and technician. The pending queue is not used as an attendance roster;
+    zero-completion/absence cannot be inferred without a separate daily SA roster.
     """
     columns = [
         "Executive", "Franchise", "Service Ambassador", "Calls Done", "Daily Target",
@@ -1314,8 +1328,13 @@ def _service_ambassador_target_hierarchy(
             out = out.loc[out[col].map(norm) == norm(selection)]
         return out
 
-    # Build an observed SA roster. Add assigned SAs from active pending calls (including
-    # zero-completion SAs), plus people represented in call/closure activity on the date.
+    # Build the SA roster from the Soft Closure workbook itself, not from the large
+    # pending queue. Pending tickets can contain technicians from many historical
+    # assignments and are not a reliable roster of people scheduled to work that day.
+    # Using them here inflates the daily target denominator and can make the chart look
+    # empty or misleading (e.g. 18 closures divided across hundreds of observed names).
+    # The closure workbook can support productivity for SAs with dated activity; a true
+    # zero-completion roster would require an attendance/active-SA roster source.
     roster: dict[tuple[str, str, str], dict[str, str]] = {}
 
     def add_roster(executive: Any, franchise: Any, technician: Any) -> None:
@@ -1328,14 +1347,8 @@ def _service_ambassador_target_hierarchy(
         if key not in roster:
             roster[key] = {"Executive": ex, "Franchise": fr, "Service Ambassador": sa}
 
-    if pending_roster is not None and not pending_roster.empty:
-        roster_exec = find_col(pending_roster, ["Service Executive Name", "Branch Exe Name", "Branch Executive Name", "Executive Name"])
-        roster_fr = find_col(pending_roster, ["Franchise Name", "FrName", "Franchise"])
-        roster_sa = find_col(pending_roster, ["Technician Name", "Service Ambassador", "Service Ambassador Name", "Technician"])
-        if roster_sa:
-            for _, row in pending_roster.iterrows():
-                add_roster(row.get(roster_exec, "") if roster_exec else "",
-                           row.get(roster_fr, "") if roster_fr else "", row.get(roster_sa, ""))
+    # Do not add every technician in the pending export to the daily SA target roster;
+    # that export is a backlog snapshot, not a daily attendance or working roster.
 
     daily_activity_mask = event_day.eq(analysis_date) | booking_day.eq(analysis_date)
     daily_activity = row_in_scope(source.loc[daily_activity_mask].copy())
@@ -1395,10 +1408,10 @@ def _service_ambassador_target_hierarchy(
     result = result.merge(fr_roll, on=["Executive", "Franchise"], how="left").merge(ex_roll, on="Executive", how="left")
     result = result.sort_values(["Executive", "Franchise", "Calls Done", "Service Ambassador"],
                                 ascending=[True, True, False, True], kind="stable").reset_index(drop=True)
-    note = (f"Daily completed distinct tickets on {analysis_date:%d %b %Y}; target = {daily_target} calls per observed SA. "
-            "Observed SA roster comes from active pending assignments and the selected day's report activity; attendance/leave data is not available.")
+    note = (f"Daily distinct completed tickets on {analysis_date:%d %b %Y}; target = {daily_target} calls per SA listed in dated Soft Closure activity. "
+            "This roster reflects the uploaded closure workbook only; zero-completion SAs and attendance/leave cannot be inferred without a separate daily roster.")
     if completion_rows.empty:
-        note = f"No completed tickets with a valid closure timestamp were recorded on {analysis_date:%d %b %Y}; target attainment shown as 0% for observed SAs. Attendance/leave data is not available."
+        note = f"No completed tickets with a valid closure timestamp were recorded on {analysis_date:%d %b %Y}. A zero-output roster needs a separate daily SA roster or attendance file."
     return result[columns], note
 
 

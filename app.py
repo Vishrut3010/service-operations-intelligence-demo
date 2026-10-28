@@ -421,6 +421,11 @@ def read_csv_report(filename: str, data: bytes, order: int) -> dict:
     from service_ops_engine_v3 import _classify
 
     report_type = _classify(df)
+    # CSV exports sometimes have overlapping columns; use the supplied report name
+    # to disambiguate a Soft Closure export from Calls Registered.
+    name_hint = filename.casefold().replace("_", " ").replace("-", " ")
+    if "soft closure" in name_hint or "soft_closure" in filename.casefold():
+        report_type = "soft_closure"
     if report_type == "unknown":
         raise ValueError("The CSV columns do not match a supported report type.")
     snapshot_dt = pd.Timestamp.now().floor("min")
