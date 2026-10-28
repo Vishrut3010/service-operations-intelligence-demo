@@ -1257,79 +1257,127 @@ def _soft_closure_candidates_for_date(
     return sorted(pool, key=_report_sort_key)
 
 
+def _completion_timestamp_series(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    """Return (completion timestamps, completed-status mask) for supported exports.
+
+    Calls Registered exports contain Technician Name, Status, Soft Closure Date and
+    CLOSED TIME. A separate Soft Closure export may contain the same event fields.
+    Prefer Soft Closure Date for resolved/soft-closed tickets, and CLOSED TIME for
+    Closed/Completed tickets, with the other field as a fallback. 1900 placeholders
+    are removed by _valid_datetime_series.
+    """
+    status_col = find_col(df, ["Status", "Call Status"]) if df is not None and not df.empty else None
+    if not status_col:
+        return (pd.Series(pd.NaT, index=df.index if df is not None else [], dtype="datetime64[ns]"),
+                pd.Series(False, index=df.index if df is not None else [], dtype=bool))
+    status = df[status_col].map(norm)
+    soft_col = find_col(df, ["Soft Closure Date", "Soft Closed Date", "SoftClosureDate", "Closure Date"])
+    closed_col = find_col(df, ["CLOSED TIME", "Closed Time", "ClosedDate", "Closed Date", "Closed Timestamp"])
+    soft_ts = (_valid_datetime_series(df[soft_col]) if soft_col else
+               pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]"))
+    closed_ts = (_valid_datetime_series(df[closed_col]) if closed_col else
+                 pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]"))
+    is_soft = status.map(lambda value: "resolved" in value or "softclosure" in value)
+    event_ts = closed_ts.copy()
+    soft_status_idx = is_soft[is_soft].index
+    other_status_idx = is_soft[~is_soft].index
+    if len(soft_status_idx):
+        event_ts.loc[soft_status_idx] = soft_ts.loc[soft_status_idx].fillna(closed_ts.loc[soft_status_idx])
+    if len(other_status_idx):
+        event_ts.loc[other_status_idx] = closed_ts.loc[other_status_idx].fillna(soft_ts.loc[other_status_idx])
+    completed_mask = status.map(lambda value: ("resolved" in value) or ("closed" in value) or ("completed" in value))
+    return event_ts, completed_mask
+
+
+def _daily_completed_rows(df: pd.DataFrame, analysis_date: date) -> pd.DataFrame:
+    """Distinct-source rows eligible for daily completion counting on analysis_date."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    ticket_col = get_ticket_col(df)
+    if not ticket_col:
+        return pd.DataFrame()
+    event_ts, completed_mask = _completion_timestamp_series(df)
+    day_mask = event_ts.dt.date.eq(analysis_date)
+    out = df.loc[completed_mask & day_mask].copy()
+    if out.empty:
+        return out
+    call_type_col = find_col(out, ["Call Type", "CallType"])
+    if call_type_col:
+        out = out.loc[~excluded_pending_call_type_mask(out)].copy()
+    if out.empty:
+        return out
+    # Preserve the timestamp calculated against the source rows after filtering.
+    out["__completion_timestamp"] = event_ts.loc[out.index]
+    out["__ticket_key"] = out[ticket_col].map(clean_text)
+    out = out.loc[out["__ticket_key"].ne("")].copy()
+    return out
+
+
+def _productivity_source_for_date(
+    reports: List[Dict[str, Any]], analysis_date: date,
+    selected_soft_order: Optional[int] = None,
+    selected_calls_order: Optional[int] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Choose a dated completion source, preferring Soft Closure then Calls Registered.
+
+    The three-file upload workflow does not include a separate Soft Closure workbook.
+    Calls Registered has the required Technician Name, Status, Soft Closure Date and
+    CLOSED TIME columns, so it is used as a fallback when it contains dated completion
+    rows. This source may not include calls booked before its report period; the note
+    returned with the chart makes that coverage limitation explicit.
+    """
+    for report_type, selected_order in (("soft_closure", selected_soft_order), ("calls_registered", selected_calls_order)):
+        candidates = []
+        for report in reports or []:
+            if report.get("report_type") != report_type:
+                continue
+            frame = report.get("df", pd.DataFrame())
+            if not frame.empty and not _daily_completed_rows(frame, analysis_date).empty:
+                candidates.append(report)
+        if not candidates:
+            continue
+        if selected_order is not None:
+            matched = [r for r in candidates if int(r.get("upload_order", -1)) == int(selected_order)]
+            if matched:
+                return matched[0], report_type
+        return max(candidates, key=_report_sort_key), report_type
+    return None, None
+
+
 def _service_ambassador_productivity(
     reports: List[Dict[str, Any]], franchise_name: str, analysis_date: date,
     selected_report_order: Optional[int] = None,
+    selected_calls_report_order: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, str]:
-    """Count distinct completed/soft-closed tickets per technician for a franchise.
-
-    Uses only a Soft Closure (All Status) report whose declared period covers the
-    selected analysis date. A completion must have a resolved/closed status and a
-    valid (non-1900-placeholder) closure timestamp. Ticket IDs are de-duplicated
-    before counting so component/spare rows cannot inflate ambassador productivity.
-    """
+    """Daily distinct completed calls per technician for a single franchise."""
     empty = pd.DataFrame(columns=["Service Ambassador", "Calls Done", "Share (%)"])
-    candidates = _soft_closure_candidates_for_date(reports, analysis_date, selected_report_order)
-    if not candidates:
-        available = [r for r in (reports or []) if _is_soft_closure_source(r)]
-        if not available:
-            return empty, "No Soft Closure workbook was detected. Upload the Excel containing the completed-call rows and Soft Closure Date."
-        return empty, f"A Soft Closure workbook was detected, but no completed rows have a valid closure timestamp on {analysis_date:%d %b %Y}. Check the report date or uploaded snapshot."
-
-    report = candidates[-1]
+    report, source_type = _productivity_source_for_date(
+        reports, analysis_date, selected_report_order, selected_calls_report_order
+    )
+    if report is None:
+        if any(r.get("report_type") in {"soft_closure", "calls_registered"} for r in reports or []):
+            return empty, f"No completed rows with a valid timestamp were found for {analysis_date:%d %b %Y}."
+        return empty, "Upload Calls Registered (or Soft Closure) with Technician Name, Status and closure timestamps to calculate daily SA productivity."
     df = report.get("df", pd.DataFrame()).copy()
-    if df.empty:
-        return empty, "The selected Soft Closure report contains no rows."
-
     franchise_col = find_col(df, ["Franchise Name", "FrName", "Franchise"])
-    ticket_col = get_ticket_col(df)
-    tech_col = find_col(df, ["Service Ambassador", "Service Ambassador Name", "Technician Name", "Technician"])
-    status_col = find_col(df, ["Status", "Call Status"])
-    if not franchise_col or not ticket_col or not tech_col or not status_col:
-        return empty, "The Soft Closure report is missing franchise, ticket, technician or status columns."
-
-    scoped = df.loc[df[franchise_col].map(norm) == norm(franchise_name)].copy()
-    if scoped.empty:
-        return empty, "No Soft Closure rows match this franchise in the selected report period."
-
-    # Prefer the soft-closure event timestamp; fall back to a genuine closed date.
-    event_col = find_col(scoped, ["Soft Closure Date", "Soft Closed Date", "SoftClosureDate"])
-    event_ts = (_valid_datetime_series(scoped[event_col]) if event_col else
-                pd.Series(pd.NaT, index=scoped.index, dtype="datetime64[ns]"))
-    closed_col = find_col(scoped, ["ClosedDate", "Closed Date", "Closed Time", "Closed Timestamp"])
-    if closed_col:
-        event_ts = event_ts.fillna(_valid_datetime_series(scoped[closed_col]))
-    scoped["_completion_timestamp"] = event_ts
-    status_values = scoped[status_col].map(norm)
-    completed = status_values.map(lambda v: ("resolved" in v) or ("closed" in v) or ("completed" in v))
-    scoped = scoped.loc[completed & scoped["_completion_timestamp"].notna()].copy()
-    if scoped.empty:
-        period = report.get("metadata") or f"{analysis_date:%d %b %Y}"
-        return empty, f"No resolved/closed calls with valid closure timestamps were found for {period}."
-
-    # Productivity is strictly daily even when the source workbook is cumulative:
-    # count only completion events whose actual timestamp date equals analysis_date.
-    event_dates = scoped["_completion_timestamp"].dt.date
-    scoped = scoped.loc[event_dates == analysis_date].copy()
-    if scoped.empty:
-        return empty, f"No completed calls have a valid closure timestamp on {analysis_date:%d %b %Y}."
-
-    # One ticket contributes once. If multiple rows exist, attribute it to the most
-    # recent recorded closure event (stable source order for timestamp ties).
-    scoped["_ticket_key"] = scoped[ticket_col].map(clean_text)
-    scoped["_technician"] = scoped[tech_col].map(lambda v: clean_text(v) or "Unspecified")
-    scoped = scoped.loc[scoped["_ticket_key"] != ""].sort_values("_completion_timestamp", kind="stable")
-    scoped = scoped.drop_duplicates(subset=["_ticket_key"], keep="last")
-    if scoped.empty:
-        return empty, "No distinct completed ticket numbers were available for productivity analysis."
-
-    summary = scoped.groupby("_technician", dropna=False).agg(**{"Calls Done": ("_ticket_key", "nunique")}).reset_index()
-    summary = summary.rename(columns={"_technician": "Service Ambassador"})
+    tech_col = find_col(df, ["Technician Name", "Service Ambassador", "Service Ambassador Name", "Technician"])
+    if not franchise_col or not tech_col:
+        return empty, "The completion report needs franchise and technician columns for daily productivity."
+    completed_rows = _daily_completed_rows(df, analysis_date)
+    if completed_rows.empty:
+        return empty, f"No completed tickets with valid timestamps were found for {analysis_date:%d %b %Y}."
+    completed_rows = completed_rows.loc[completed_rows[franchise_col].map(norm) == norm(franchise_name)].copy()
+    if completed_rows.empty:
+        return empty, "No completed rows for this franchise were found in the selected source report."
+    completed_rows["__technician"] = completed_rows[tech_col].map(lambda value: clean_text(value) or "Unspecified SA")
+    completed_rows = completed_rows.sort_values("__completion_timestamp", kind="stable").drop_duplicates("__ticket_key", keep="last")
+    summary = completed_rows.groupby("__technician", dropna=False).agg(**{"Calls Done": ("__ticket_key", "nunique")}).reset_index()
+    summary = summary.rename(columns={"__technician": "Service Ambassador"})
     total = int(summary["Calls Done"].sum())
     summary["Share (%)"] = (summary["Calls Done"] * 100.0 / total).round(1) if total else 0.0
     summary = summary.sort_values(["Calls Done", "Service Ambassador"], ascending=[False, True], kind="stable").reset_index(drop=True)
-    period_label = report.get("metadata") or f"{analysis_date:%d %b %Y}"
-    return summary, f"Resolved/soft-closed unique tickets · {period_label}"
+    source_label = "Soft Closure report" if source_type == "soft_closure" else "Calls Registered report"
+    return summary, f"Distinct completed tickets on {analysis_date:%d %b %Y} · source: {source_label}"
 
 
 def _service_ambassador_target_hierarchy(
@@ -1339,15 +1387,16 @@ def _service_ambassador_target_hierarchy(
     scope_mode: str = "branch",
     selection: str = "",
     selected_report_order: Optional[int] = None,
+    selected_calls_report_order: Optional[int] = None,
     daily_target: int = 6,
 ) -> Tuple[pd.DataFrame, str]:
-    """Build daily SA productivity grouped Executive -> Franchise -> SA.
+    """Daily SA productivity grouped Executive -> Franchise -> SA.
 
-    Completion counts use distinct tickets with resolved/closed/completed status and a
-    valid closure timestamp on exactly analysis_date. The SA roster is derived from dated
-    activity rows in the selected Soft Closure workbook itself, grouped by executive,
-    franchise and technician. The pending queue is not used as an attendance roster;
-    zero-completion/absence cannot be inferred without a separate daily SA roster.
+    Uses a dated Soft Closure report when available; otherwise derives completions from
+    Calls Registered rows by using Technician Name, Status, Soft Closure Date and CLOSED
+    TIME. Only distinct tickets with a valid completion timestamp on analysis_date count.
+    The Calls Registered fallback is limited to tickets present in that registration
+    report's period, so older-booked calls closed on the day may not be represented.
     """
     columns = [
         "Executive", "Franchise", "Service Ambassador", "Calls Done", "Daily Target",
@@ -1357,37 +1406,27 @@ def _service_ambassador_target_hierarchy(
     ]
     empty = pd.DataFrame(columns=columns)
     mode = (scope_mode or "branch").strip().lower()
-    candidates = _soft_closure_candidates_for_date(reports, analysis_date, selected_report_order)
-    if not candidates:
-        available = [r for r in (reports or []) if _is_soft_closure_source(r)]
-        if not available:
-            return empty, "No Soft Closure workbook was detected. Upload the Excel containing completed-call rows and a Soft Closure Date."
-        return empty, f"A Soft Closure workbook was detected, but no completed rows have a valid closure timestamp on {analysis_date:%d %b %Y}. Check the report date or uploaded snapshot."
-    report = candidates[-1]
+    report, source_type = _productivity_source_for_date(
+        reports, analysis_date, selected_report_order, selected_calls_report_order
+    )
+    if report is None:
+        if any(r.get("report_type") in {"soft_closure", "calls_registered"} for r in reports or []):
+            return empty, f"No completed rows with a valid closure timestamp were found for {analysis_date:%d %b %Y}."
+        return empty, "Upload Calls Registered (or Soft Closure) with Technician Name, Status and closure timestamps for the selected date."
     source = report.get("df", pd.DataFrame()).copy()
     if source.empty:
-        return empty, "The selected Soft Closure report contains no rows."
+        return empty, "The selected completion report contains no rows."
 
     ticket_col = get_ticket_col(source)
     franchise_col = find_col(source, ["Franchise Name", "FrName", "Franchise"])
     executive_col = find_col(source, ["Branch Exe Name", "Service Executive Name", "Branch Executive Name", "Executive Name"])
     technician_col = find_col(source, ["Technician Name", "Service Ambassador", "Service Ambassador Name", "Technician"])
-    status_col = find_col(source, ["Status", "Call Status"])
-    if not ticket_col or not franchise_col or not technician_col or not status_col:
-        return empty, "The Soft Closure report needs ticket, franchise, technician and status columns for daily productivity."
+    if not ticket_col or not franchise_col or not technician_col:
+        return empty, "The completion report needs ticket, franchise and technician columns for daily productivity."
 
-    event_col = find_col(source, ["Soft Closure Date", "Soft Closed Date", "SoftClosureDate", "Closure Date"])
-    event_ts = (_valid_datetime_series(source[event_col]) if event_col else
-                pd.Series(pd.NaT, index=source.index, dtype="datetime64[ns]"))
-    closed_col = find_col(source, ["ClosedDate", "Closed Date", "Closed Time", "Closed Timestamp"])
-    if closed_col:
-        event_ts = event_ts.fillna(_valid_datetime_series(source[closed_col]))
-    source["__completion_ts"] = event_ts
-    event_day = source["__completion_ts"].dt.date
-    booking_col = find_col(source, ["Call Book Date", "Call Booking Date", "Booking Date"])
-    booking_ts = (_valid_datetime_series(source[booking_col]) if booking_col else
-                  pd.Series(pd.NaT, index=source.index, dtype="datetime64[ns]"))
-    booking_day = booking_ts.dt.date
+    completion_rows = _daily_completed_rows(source, analysis_date)
+    if completion_rows.empty:
+        return empty, f"No resolved/closed tickets with valid completion timestamps were found on {analysis_date:%d %b %Y}."
 
     def row_in_scope(frame: pd.DataFrame) -> pd.DataFrame:
         out = frame
@@ -1403,71 +1442,26 @@ def _service_ambassador_target_hierarchy(
             out = out.loc[out[col].map(norm) == norm(selection)]
         return out
 
-    # Build the SA roster from the Soft Closure workbook itself, not from the large
-    # pending queue. Pending tickets can contain technicians from many historical
-    # assignments and are not a reliable roster of people scheduled to work that day.
-    # Using them here inflates the daily target denominator and can make the chart look
-    # empty or misleading (e.g. 18 closures divided across hundreds of observed names).
-    # The closure workbook can support productivity for SAs with dated activity; a true
-    # zero-completion roster would require an attendance/active-SA roster source.
-    roster: dict[tuple[str, str, str], dict[str, str]] = {}
+    completion_rows = row_in_scope(completion_rows).copy()
+    if completion_rows.empty:
+        return empty, f"No completed tickets matched this {mode} selection on {analysis_date:%d %b %Y}."
+    completion_rows["__executive"] = completion_rows[executive_col].map(lambda v: clean_text(v) or "Unspecified executive") if executive_col else "Unspecified executive"
+    completion_rows["__franchise"] = completion_rows[franchise_col].map(lambda v: clean_text(v) or "Unspecified franchise")
+    completion_rows["__sa"] = completion_rows[technician_col].map(lambda v: clean_text(v) or "Unspecified SA")
+    completion_rows = completion_rows.sort_values("__completion_timestamp", kind="stable").drop_duplicates("__ticket_key", keep="last")
 
-    def add_roster(executive: Any, franchise: Any, technician: Any) -> None:
-        ex = clean_text(executive) or "Unspecified executive"
-        fr = clean_text(franchise) or "Unspecified franchise"
-        sa = clean_text(technician)
-        if not sa:
-            return
-        key = (norm(ex), norm(fr), norm(sa))
-        if key not in roster:
-            roster[key] = {"Executive": ex, "Franchise": fr, "Service Ambassador": sa}
-
-    # Do not add every technician in the pending export to the daily SA target roster;
-    # that export is a backlog snapshot, not a daily attendance or working roster.
-
-    daily_activity_mask = event_day.eq(analysis_date) | booking_day.eq(analysis_date)
-    daily_activity = row_in_scope(source.loc[daily_activity_mask].copy())
-    for _, row in daily_activity.iterrows():
-        add_roster(row.get(executive_col, "") if executive_col else "",
-                   row.get(franchise_col, ""), row.get(technician_col, ""))
-
-    # Only completions timestamped on the selected date contribute to output.
-    status = source[status_col].map(norm)
-    complete_mask = status.map(lambda v: ("resolved" in v) or ("closed" in v) or ("completed" in v))
-    completion_rows = source.loc[complete_mask & event_day.eq(analysis_date)].copy()
-    completion_rows = row_in_scope(completion_rows)
-    if not completion_rows.empty:
-        call_type_col = find_col(completion_rows, ["Call Type", "CallType"])
-        if call_type_col:
-            completion_rows = completion_rows.loc[~excluded_pending_call_type_mask(completion_rows)].copy()
-        completion_rows["__ticket_key"] = completion_rows[ticket_col].map(clean_text)
-        completion_rows["__executive"] = completion_rows[executive_col].map(lambda v: clean_text(v) or "Unspecified executive") if executive_col else "Unspecified executive"
-        completion_rows["__franchise"] = completion_rows[franchise_col].map(lambda v: clean_text(v) or "Unspecified franchise")
-        completion_rows["__sa"] = completion_rows[technician_col].map(lambda v: clean_text(v) or "Unspecified SA")
-        completion_rows = completion_rows.loc[completion_rows["__ticket_key"].ne("")].sort_values("__completion_ts", kind="stable")
-        # One ticket is one completion. For duplicates, assign to the latest event row.
-        completion_rows = completion_rows.drop_duplicates(subset=["__ticket_key"], keep="last")
-        for _, row in completion_rows.iterrows():
-            add_roster(row["__executive"], row["__franchise"], row["__sa"])
-
-    if not roster:
-        return empty, "No Service Ambassador names were available from the uploaded reports for this view."
-
-    done_counts: dict[tuple[str, str, str], int] = {}
-    if not completion_rows.empty:
-        for _, row in completion_rows.iterrows():
-            key = (norm(row["__executive"]), norm(row["__franchise"]), norm(row["__sa"]))
-            done_counts[key] = done_counts.get(key, 0) + 1
-
-    rows = []
-    for key, names in roster.items():
-        rows.append({**names, "Calls Done": int(done_counts.get(key, 0)), "Daily Target": int(daily_target)})
-    result = pd.DataFrame(rows)
+    # Productivity roster is derived from SAs with a recorded completion on this date.
+    # Zero-completion/absence cannot be inferred without a separate daily SA roster.
+    grouped = completion_rows.groupby(["__executive", "__franchise", "__sa"], dropna=False).agg(
+        **{"Calls Done": ("__ticket_key", "nunique")}
+    ).reset_index().rename(columns={
+        "__executive": "Executive", "__franchise": "Franchise", "__sa": "Service Ambassador"
+    })
+    result = grouped.copy()
+    result["Daily Target"] = int(daily_target)
     result["Target Achievement (%)"] = (result["Calls Done"] * 100.0 / daily_target).round(1)
     result["Calls Short of Target"] = (daily_target - result["Calls Done"]).clip(lower=0).astype(int)
 
-    # Add franchise and executive roll-ups; this is a ratio of total calls to total SA targets,
-    # not an unweighted average of individual percentages.
     fr_roll = result.groupby(["Executive", "Franchise"], dropna=False).agg(
         **{"Franchise Calls Done": ("Calls Done", "sum"), "Franchise SA Count": ("Service Ambassador", "nunique")}
     ).reset_index()
@@ -1475,19 +1469,25 @@ def _service_ambassador_target_hierarchy(
         fr_roll["Franchise Calls Done"] / (fr_roll["Franchise SA Count"] * daily_target).replace(0, pd.NA) * 100
     ).fillna(0).round(1)
     ex_roll = result.groupby("Executive", dropna=False).agg(
-        **{"Executive Calls Done": ("Calls Done", "sum"), "Executive SA Count": ("Service Ambassador", "count")}
+        **{"Executive Calls Done": ("Calls Done", "sum"), "Executive SA Count": ("Service Ambassador", "nunique")}
     ).reset_index()
     ex_roll["Executive Target Achievement (%)"] = (
         ex_roll["Executive Calls Done"] / (ex_roll["Executive SA Count"] * daily_target).replace(0, pd.NA) * 100
     ).fillna(0).round(1)
     result = result.merge(fr_roll, on=["Executive", "Franchise"], how="left").merge(ex_roll, on="Executive", how="left")
-    result = result.sort_values(["Executive", "Franchise", "Calls Done", "Service Ambassador"],
-                                ascending=[True, True, False, True], kind="stable").reset_index(drop=True)
-    note = (f"Daily distinct completed tickets on {analysis_date:%d %b %Y}; target = {daily_target} calls per SA listed in dated Soft Closure activity. "
-            "This roster reflects the uploaded closure workbook only; zero-completion SAs and attendance/leave cannot be inferred without a separate daily roster.")
-    if completion_rows.empty:
-        note = f"No completed tickets with a valid closure timestamp were recorded on {analysis_date:%d %b %Y}. A zero-output roster needs a separate daily SA roster or attendance file."
-    return result[columns], note
+    result = result[columns].sort_values(
+        ["Executive", "Franchise", "Calls Done", "Service Ambassador"],
+        ascending=[True, True, False, True], kind="stable"
+    ).reset_index(drop=True)
+
+    if source_type == "calls_registered":
+        note = (f"Distinct tickets with a resolved/closed status and valid completion timestamp on {analysis_date:%d %b %Y}, counted from the Calls Registered export. "
+                "This reflects calls present in that report's registration period; older-booked calls closed that day may be absent. "
+                "Only SAs with a recorded completion are shown; zero-completion SAs require a daily roster.")
+    else:
+        note = (f"Daily distinct completed tickets on {analysis_date:%d %b %Y}, counted from the Soft Closure report. "
+                "Only SAs with a recorded completion are shown; zero-completion SAs require a daily roster.")
+    return result, note
 
 
 def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selection: str = "") -> Dict[str, Any]:
@@ -1697,6 +1697,7 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
         analysis.get("reports", []), analysis.get("analysis_date", date.today()), priorities,
         scope_mode=mode, selection=clean_text(selection),
         selected_report_order=analysis.get("selected_report_orders", {}).get("soft_closure"),
+        selected_calls_report_order=analysis.get("selected_report_orders", {}).get("calls_registered"),
         daily_target=6,
     )
     scoped["sa_productivity_hierarchy"] = productivity_hierarchy
@@ -1706,6 +1707,7 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
         productivity, productivity_note = _service_ambassador_productivity(
             analysis.get("reports", []), clean_text(selection), analysis.get("analysis_date", date.today()),
             selected_report_order=analysis.get("selected_report_orders", {}).get("soft_closure"),
+            selected_calls_report_order=analysis.get("selected_report_orders", {}).get("calls_registered"),
         )
         scoped["service_ambassador_productivity"] = productivity
         scoped["service_ambassador_productivity_note"] = productivity_note
@@ -2208,7 +2210,7 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
         ax_sa.set_yticks(y_sa)
         ax_sa.set_yticklabels(labels, fontsize=7.0, color=ink)
         ax_sa.invert_yaxis()
-        style_axis(ax_sa, "SA productivity · target 6/day (top 6)", title_size=9.3)
+        style_axis(ax_sa, "SA completed calls · 6/day target (top 6)", title_size=9.3)
         ax_sa.tick_params(axis="y", labelsize=7.0, colors=ink, pad=3)
         xmax = max(6.0, float(values.max()) if len(values) else 6.0)
         ax_sa.set_xlim(0, xmax * 1.48)
@@ -2221,11 +2223,15 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
             hierarchy_label = f"{exec_values[0]}  →  {franchise_values[0]}"
         else:
             hierarchy_label = "Grouped by executive → franchise → SA"
-        tail = hierarchy_label
-        ax_sa.text(0.0, -0.15, textwrap.fill(tail, width=48),
-                   transform=ax_sa.transAxes, fontsize=6.4, color=muted, va="top", clip_on=False)
+        if "Calls Registered export" in sa_note:
+            source_note = "Source: Calls Registered; older-booked closures may be absent."
+        else:
+            source_note = "Source: dated Soft Closure report."
+        tail = f"{hierarchy_label} · {source_note}"
+        ax_sa.text(0.0, -0.15, textwrap.fill(tail, width=56),
+                   transform=ax_sa.transAxes, fontsize=6.0, color=muted, va="top", clip_on=False)
     else:
-        empty_axis(ax_sa, "SA daily productivity vs 6-call target", sa_note or "Upload a dated Soft Closure report to calculate daily target attainment.")
+        empty_axis(ax_sa, "SA daily productivity vs 6-call target", sa_note or "Upload Calls Registered with Technician Name, Status and closure timestamps to calculate daily target attainment.")
 
     # Compact three-column footer: movement, the requested OK/Not Happy counts, and data notes.
     fig.patches.append(plt.Rectangle((0.04, 0.065), 0.92, 0.165, transform=fig.transFigure,
