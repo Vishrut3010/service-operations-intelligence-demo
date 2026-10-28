@@ -28,23 +28,25 @@ st.markdown(
     """
     <style>
       :root {
-        --navy: #253846;
-        --ifb-red: #C93642;
-        --ink: #25292D;
-        --muted: #727980;
-        --line: #E4E7EA;
-        --paper: #FFFFFF;
-        --page: #F5F6F7;
+        --navy: #172634;
+        --navy-2: #223444;
+        --ifb-red: #D6424E;
+        --ink: #EDF2F7;
+        --muted: #B3C0CC;
+        --line: #344657;
+        --paper: #1A2733;
+        --page: #101820;
         --brand-serif: "Rockwell Extra Bold", Rockwell, "Roboto Slab", Georgia, serif;
         --body-sans: Arial, "Helvetica Neue", Helvetica, sans-serif;
       }
-      html, body, [data-testid="stAppViewContainer"] {
-        font-family: var(--body-sans);
-        color: var(--ink);
+      html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+        font-family: var(--body-sans) !important;
+        color: var(--ink) !important;
+        background: var(--page) !important;
       }
       #MainMenu, footer, header { visibility: hidden; }
       [data-testid="stAppViewContainer"] {
-        background: linear-gradient(160deg, #FAFAFA 0%, #F4F6F7 60%, #F9F9F8 100%);
+        background: radial-gradient(ellipse at top left, #1B2A37 0%, #101820 58%, #0D141B 100%) !important;
       }
       [data-testid="stMain"] .block-container {
         max-width: 1450px;
@@ -60,10 +62,10 @@ st.markdown(
         min-height: 145px;
         padding: 25px 27px;
         margin-bottom: 22px;
-        border: 1px solid rgba(222, 226, 229, .95);
+        border: 1px solid #344758;
         border-radius: 19px;
-        background: linear-gradient(112deg, #FFFFFF 0%, #FFFFFF 48%, #F7F8F8 100%);
-        box-shadow: 0 12px 32px rgba(31, 43, 50, .055);
+        background: linear-gradient(112deg, #1A2733 0%, #1D2D3B 55%, #243441 100%);
+        box-shadow: 0 12px 32px rgba(0, 0, 0, .24);
       }
       .brand-logo {
         position: relative;
@@ -73,13 +75,15 @@ st.markdown(
         width: 138px;
         height: auto;
         object-fit: contain;
-        border: 0;
+        border: 1px solid #E6E9EC;
+        border-radius: 9px;
         background: #FFFFFF;
+        padding: 3px;
       }
       .hero-copy { position: relative; z-index: 2; min-width: 0; }
       .eyebrow {
         margin: 0 0 7px 0;
-        color: var(--ifb-red);
+        color: #FF737B;
         font-family: var(--body-sans);
         font-size: 10px;
         line-height: 1.3;
@@ -88,7 +92,7 @@ st.markdown(
       }
       .hero h1 {
         margin: 0;
-        color: #303236;
+        color: #F4F7FA;
         font-family: var(--brand-serif);
         font-size: clamp(23px, 3.5vw, 31px);
         font-weight: 800;
@@ -97,7 +101,7 @@ st.markdown(
       }
       .hero p {
         margin: 9px 0 0 0;
-        color: #666D73;
+        color: #BDCAD4;
         font-family: var(--body-sans);
         font-size: 13px;
         line-height: 1.45;
@@ -107,14 +111,14 @@ st.markdown(
         align-items: center;
         gap: 11px;
         margin: 2px 0 4px 0;
-        color: var(--ink);
+        color: #F0F4F8;
         font-family: var(--body-sans);
         font-size: 16px;
         font-weight: 750;
       }
       .upload-subtitle {
         margin: 0 0 13px 0;
-        color: var(--muted);
+        color: #AEBCC8;
         font-family: var(--body-sans);
         font-size: 12px;
         line-height: 1.5;
@@ -126,30 +130,34 @@ st.markdown(
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        color: #34383B;
-        background: #ECEEEF;
+        color: #FFFFFF;
+        background: #3A2730;
         font-size: 18px;
       }
       div[data-testid="stFileUploader"] {
-        padding: 8px 10px;
-        border: 1px dashed #BFC6CB;
+        padding: 10px 12px;
+        border: 1px dashed #506273;
         border-radius: 14px;
-        background: rgba(255,255,255,.9);
+        background: rgba(27, 40, 52, .92) !important;
       }
       div[data-testid="stFileUploader"] section {
-        border: 0;
-        background: transparent;
+        border: 0 !important;
+        background: transparent !important;
       }
-      /* Keep Streamlit's Browse files control visible in its normal state too. */
+      div[data-testid="stFileUploader"] section > div,
+      div[data-testid="stFileUploaderDropzone"] {
+        background: transparent !important;
+        color: #EAF0F5 !important;
+      }
       div[data-testid="stFileUploader"] button,
       div[data-testid="stFileUploader"] section button,
       div[data-testid="stFileUploaderDropzone"] button,
       div[data-testid="stFileUploaderDropzone"] button[kind="secondary"],
       div[data-testid="stFileUploaderDropzone"] button[data-testid="stBaseButton-secondary"] {
-        color: #253846 !important;
-        -webkit-text-fill-color: #253846 !important;
-        background: #F1F3F4 !important;
-        border: 1px solid #C93642 !important;
+        color: #F5F7FA !important;
+        -webkit-text-fill-color: #F5F7FA !important;
+        background: #354858 !important;
+        border: 1px solid #D6424E !important;
         opacity: 1 !important;
         visibility: visible !important;
         text-shadow: none !important;
@@ -165,16 +173,16 @@ st.markdown(
         color: #FFFFFF !important;
         -webkit-text-fill-color: #FFFFFF !important;
         background: #C93642 !important;
-        border-color: #AE2733 !important;
+        border-color: #F06C75 !important;
       }
       div[data-testid="stFileUploader"] button:focus,
       div[data-testid="stFileUploader"] button:focus-visible,
       div[data-testid="stFileUploaderDropzone"] button:focus,
       div[data-testid="stFileUploaderDropzone"] button:focus-visible {
-        color: #253846 !important;
-        -webkit-text-fill-color: #253846 !important;
-        background: #F1F3F4 !important;
-        outline: 2px solid rgba(201, 54, 66, .28) !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+        background: #354858 !important;
+        outline: 2px solid rgba(255, 115, 123, .55) !important;
         outline-offset: 2px !important;
       }
       div[data-testid="stDownloadButton"] button {
@@ -185,53 +193,48 @@ st.markdown(
         font-family: var(--body-sans);
         font-size: 13px;
         font-weight: 750;
-        border: 1px solid transparent;
-        box-shadow: 0 6px 16px rgba(31, 43, 50, .09);
+        border: 1px solid #526170;
+        box-shadow: 0 6px 16px rgba(0, 0, 0, .24);
         transition: transform .12s ease, box-shadow .12s ease;
       }
       div[data-testid="stDownloadButton"] button:hover {
         transform: translateY(-1px);
-        box-shadow: 0 9px 22px rgba(31, 43, 50, .13);
+        box-shadow: 0 9px 22px rgba(0, 0, 0, .32);
       }
       div[data-testid="stHorizontalBlock"] > div:first-child div[data-testid="stDownloadButton"] button {
-        background: linear-gradient(135deg, #C93642, #AE2733);
-        color: white;
+        background: linear-gradient(135deg, #D6424E, #AE2733) !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
       }
       div[data-testid="stHorizontalBlock"] > div:nth-child(2) div[data-testid="stDownloadButton"] button {
-        background: linear-gradient(135deg, #45484B, #292D30);
-        color: white;
+        background: linear-gradient(135deg, #354858, #263541) !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
       }
-      /* High-contrast upload/status alerts: pale yellow background, dark readable text. */
-      [data-testid="stAlert"],
-      div.stAlert,
-      [role="alert"] {
-        background: #FFF7D6 !important;
-        border: 1px solid #D7A52A !important;
-        border-left: 5px solid #9A6700 !important;
+      /* Dark, high-contrast status alerts. */
+      [data-testid="stAlert"], div.stAlert, [role="alert"] {
+        background: #3A311D !important;
+        border: 1px solid #8B7131 !important;
+        border-left: 5px solid #E5B94B !important;
         border-radius: 11px !important;
-        color: #25292D !important;
+        color: #FFE7A3 !important;
         box-shadow: none !important;
       }
-      [data-testid="stAlert"] *,
-      div.stAlert *,
-      [role="alert"] * {
-        color: #25292D !important;
-        -webkit-text-fill-color: #25292D !important;
+      [data-testid="stAlert"] *, div.stAlert *, [role="alert"] * {
+        color: #FFE7A3 !important;
+        -webkit-text-fill-color: #FFE7A3 !important;
         text-shadow: none !important;
         opacity: 1 !important;
       }
-      [data-testid="stAlert"] svg,
-      div.stAlert svg,
-      [role="alert"] svg {
-        color: #8A5A00 !important;
-        fill: #8A5A00 !important;
+      [data-testid="stAlert"] svg, div.stAlert svg, [role="alert"] svg {
+        color: #F1C75B !important;
+        fill: #F1C75B !important;
       }
-      /* Keep text explaining uploader limits/help readable against the dropzone. */
       div[data-testid="stFileUploader"] small,
       div[data-testid="stFileUploader"] [data-testid="stMarkdownContainer"],
       div[data-testid="stFileUploader"] [data-testid="stMarkdownContainer"] p {
-        color: #3A4248 !important;
-        -webkit-text-fill-color: #3A4248 !important;
+        color: #B8C6D1 !important;
+        -webkit-text-fill-color: #B8C6D1 !important;
         opacity: 1 !important;
       }
       .ready-line {
@@ -240,10 +243,10 @@ st.markdown(
         gap: 9px;
         margin: 20px 0 13px 0;
         padding: 11px 14px;
-        border: 1px solid #E2E6E8;
+        border: 1px solid #354858;
         border-radius: 11px;
-        background: rgba(255,255,255,.8);
-        color: #4E585F;
+        background: rgba(30, 45, 58, .9);
+        color: #D1DCE5;
         font-family: var(--body-sans);
         font-size: 12px;
         font-weight: 700;
@@ -252,10 +255,10 @@ st.markdown(
         width: 8px;
         height: 8px;
         border-radius: 50%;
-        background: #4E9A70;
-        box-shadow: 0 0 0 4px rgba(78,154,112,.12);
+        background: #54C18B;
+        box-shadow: 0 0 0 4px rgba(84,193,139,.13);
       }
-      /* Tab-style radio navigation: always visible, high contrast, and responsive. */
+      /* Persistent dark tab navigation with high contrast in every state. */
       div[data-testid="stRadio"] div[role="radiogroup"] {
         display: flex !important;
         flex-wrap: nowrap !important;
@@ -264,74 +267,10 @@ st.markdown(
         width: 100% !important;
         padding: 7px !important;
         margin: 6px 0 14px 0 !important;
-        background: #E9EDF0 !important;
-        border: 1px solid #D2DAE0 !important;
+        background: #151F29 !important;
+        border: 1px solid #344657 !important;
         border-radius: 14px !important;
       }
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] {
-        flex: 1 1 0 !important;
-        display: flex !important;
-        justify-content: center !important;
-        align-items: center !important;
-        min-height: 46px !important;
-        padding: 9px 14px !important;
-        margin: 0 !important;
-        background: #FFFFFF !important;
-        border: 1px solid #CFD7DE !important;
-        border-radius: 10px !important;
-        color: #20384B !important;
-        opacity: 1 !important;
-        cursor: pointer !important;
-      }
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] p,
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] span,
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] div {
-        color: inherit !important;
-        -webkit-text-fill-color: inherit !important;
-        opacity: 1 !important;
-        font-weight: 800 !important;
-      }
-      /* Hide the small radio glyph so the choices read as tabs, while keeping them keyboard-accessible. */
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] > div:first-child {
-        display: none !important;
-      }
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) {
-        background: #253846 !important;
-        border-color: #253846 !important;
-        color: #FFFFFF !important;
-        box-shadow: 0 3px 9px rgba(37,56,70,.16) !important;
-      }
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) p,
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) span,
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:has(input:checked) div {
-        color: #FFFFFF !important;
-        -webkit-text-fill-color: #FFFFFF !important;
-      }
-      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"]:hover:not(:has(input:checked)) {
-        background: #FFF1F2 !important;
-        border-color: #C93642 !important;
-        color: #A82732 !important;
-      }
-      div[data-testid="stRadio"] div[role="radiogroup"] input:focus-visible + div {
-        outline: 2px solid #C93642 !important;
-        outline-offset: 2px !important;
-      }
-      [data-testid="stSelectbox"] label {
-        color: #253846 !important;
-        font-weight: 750 !important;
-      }
-      @media (max-width: 760px) {
-        [data-testid="stMain"] .block-container { padding-left: 1rem; padding-right: 1rem; }
-        .hero { padding: 20px 16px; gap: 13px; min-height: 126px; }
-        .brand-logo { width: 105px; }
-        .hero h1 { font-size: 22px; }
-        .hero p { font-size: 12px; }
-        div[data-testid="stRadio"] div[role="radiogroup"] { gap: 5px !important; padding: 5px !important; }
-        div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] { padding: 8px 5px !important; min-height: 42px !important; }
-        div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"] p { font-size: 11px !important; }
-      }
-      /* Strong, DOM-version-independent tab styles. In Streamlit, data-baseweb="radio"
-         usually belongs to a wrapper DIV, not the label itself; style both structures. */
       div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"] {
         flex: 1 1 0 !important;
         min-width: 0 !important;
@@ -340,6 +279,7 @@ st.markdown(
         border: 0 !important;
         background: transparent !important;
       }
+      div[data-testid="stRadio"] div[role="radiogroup"] label[data-baseweb="radio"],
       div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"] label,
       div[data-testid="stRadio"] div[role="radiogroup"] > label,
       div[data-testid="stRadio"] div[role="radiogroup"] label {
@@ -351,11 +291,11 @@ st.markdown(
         justify-content: center !important;
         margin: 0 !important;
         padding: 10px 14px !important;
-        border: 1px solid #CFD7DE !important;
+        border: 1px solid #405465 !important;
         border-radius: 10px !important;
-        background: #FFFFFF !important;
-        color: #20384B !important;
-        -webkit-text-fill-color: #20384B !important;
+        background: #243442 !important;
+        color: #E9F0F5 !important;
+        -webkit-text-fill-color: #E9F0F5 !important;
         opacity: 1 !important;
         cursor: pointer !important;
       }
@@ -364,20 +304,21 @@ st.markdown(
       div[data-testid="stRadio"] div[role="radiogroup"] label span,
       div[data-testid="stRadio"] div[role="radiogroup"] label div,
       div[data-testid="stRadio"] div[role="radiogroup"] label [data-testid="stMarkdownContainer"] {
-        color: #20384B !important;
-        -webkit-text-fill-color: #20384B !important;
+        color: inherit !important;
+        -webkit-text-fill-color: inherit !important;
         opacity: 1 !important;
         text-shadow: none !important;
         font-weight: 800 !important;
       }
+      div[data-testid="stRadio"] div[role="radiogroup"] label > div:first-child { display: none !important; }
       div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"]:has(input:checked) label,
       div[data-testid="stRadio"] div[role="radiogroup"] label:has(input:checked),
       div[data-testid="stRadio"] div[role="radiogroup"] label[aria-checked="true"] {
-        background: #253846 !important;
-        border-color: #253846 !important;
+        background: #C93642 !important;
+        border-color: #F06C75 !important;
         color: #FFFFFF !important;
         -webkit-text-fill-color: #FFFFFF !important;
-        box-shadow: 0 3px 9px rgba(37,56,70,.16) !important;
+        box-shadow: 0 3px 12px rgba(214,66,78,.24) !important;
       }
       div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"]:has(input:checked) label *,
       div[data-testid="stRadio"] div[role="radiogroup"] label:has(input:checked) *,
@@ -386,14 +327,14 @@ st.markdown(
         -webkit-text-fill-color: #FFFFFF !important;
       }
       div[data-testid="stRadio"] div[role="radiogroup"] label:hover:not(:has(input:checked)) {
-        background: #FFF1F2 !important;
-        border-color: #C93642 !important;
-        color: #A82732 !important;
-        -webkit-text-fill-color: #A82732 !important;
+        background: #354858 !important;
+        border-color: #D6424E !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
       }
       div[data-testid="stRadio"] div[role="radiogroup"] label:hover:not(:has(input:checked)) * {
-        color: #A82732 !important;
-        -webkit-text-fill-color: #A82732 !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
       }
       div[data-testid="stRadio"] div[role="radiogroup"] label p {
         margin: 0 !important;
@@ -402,8 +343,47 @@ st.markdown(
         white-space: normal !important;
         text-align: center !important;
       }
+      div[data-testid="stRadio"] div[role="radiogroup"] input:focus-visible + div {
+        outline: 2px solid #FF737B !important;
+        outline-offset: 2px !important;
+      }
+      [data-testid="stSelectbox"] label,
+      [data-testid="stMultiSelect"] label,
+      [data-testid="stFileUploader"] label {
+        color: #E7EDF3 !important;
+        -webkit-text-fill-color: #E7EDF3 !important;
+        font-weight: 750 !important;
+      }
+      [data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+      [data-testid="stMultiSelect"] div[data-baseweb="select"] > div {
+        background: #1D2B37 !important;
+        border-color: #4A5D6D !important;
+        color: #EDF2F7 !important;
+      }
+      [data-testid="stSelectbox"] div[data-baseweb="select"] *,
+      [data-testid="stMultiSelect"] div[data-baseweb="select"] * {
+        color: #EDF2F7 !important;
+        -webkit-text-fill-color: #EDF2F7 !important;
+      }
+      [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] *,
+      [data-testid="stMarkdownContainer"], [data-testid="stMarkdownContainer"] p,
+      .stMarkdown, .stMarkdown p, .stText, label {
+        color: #D5DEE6;
+      }
+      [data-testid="stExpander"] {
+        background: #192631 !important;
+        border: 1px solid #344657 !important;
+        border-radius: 10px !important;
+      }
+      [data-testid="stExpander"] summary,
+      [data-testid="stExpander"] summary * { color: #EAF0F5 !important; }
       @media (max-width: 760px) {
-        div[data-testid="stRadio"] div[role="radiogroup"] > div[data-baseweb="radio"] label,
+        [data-testid="stMain"] .block-container { padding-left: 1rem; padding-right: 1rem; }
+        .hero { padding: 20px 16px; gap: 13px; min-height: 126px; }
+        .brand-logo { width: 105px; }
+        .hero h1 { font-size: 22px; }
+        .hero p { font-size: 12px; }
+        div[data-testid="stRadio"] div[role="radiogroup"] { gap: 5px !important; padding: 5px !important; }
         div[data-testid="stRadio"] div[role="radiogroup"] label { padding: 8px 5px !important; min-height: 43px !important; }
         div[data-testid="stRadio"] div[role="radiogroup"] label p { font-size: 11px !important; }
       }
@@ -665,9 +645,8 @@ elif view_choice == "Franchise-wise":
                     f"{franchise_analysis['scope_summary']['aged_7_plus']:,} aged 7+ days"
                 )
                 st.caption(
-                    f"Service Ambassador productivity is for {franchise_analysis['analysis_date']:%d %b %Y} only. "
-                    "If the Soft Closure report is cumulative, records from every other date are ignored; "
-                    "only distinct resolved/closed tickets with a valid closure timestamp on this date count."
+                    "Service Ambassador productivity counts distinct tickets marked resolved/closed "
+                    "with a valid closure timestamp in the uploaded Soft Closure report period."
                 )
                 render_outputs(franchise_analysis, "franchise", safe_filename(selected_franchise))
             except Exception as exc:

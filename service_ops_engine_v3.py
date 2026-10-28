@@ -100,12 +100,13 @@ def _classify(df: pd.DataFrame) -> str:
         return "unknown"
     if "feedback" in columns and "feedbackdate" in columns:
         return "customer_satisfaction"
-    # Soft Closure (All Status) exports are used to reconcile calls closed by the snapshot time.
-    if "softclosuredate" in columns and "status" in columns:
-        return "soft_closure"
-    # Calls Registered exports also contain Days Old and repeatcall flag, so test them first.
+    # Calls Registered exports can contain Soft Closure Date and Status too;
+    # identify them before Soft Closure reports to avoid misclassifying the whole report.
     if "callbookdate" in columns and ("assignon" in columns or "closedtime" in columns):
         return "calls_registered"
+    # Soft Closure (All Status) exports support closure reconciliation and productivity.
+    if "softclosuredate" in columns and "status" in columns:
+        return "soft_closure"
     if "daysold" in columns and "repeatcallflag" in columns:
         return "pending_calls"
     return "unknown"
@@ -394,6 +395,7 @@ def enrich_pending(pending_df: pd.DataFrame, snapshot_dt: pd.Timestamp) -> pd.Da
         "Status": ["Status"],
         "Repeat Call Flag": ["repeatcall flag", "Repeat Call Flag"],
         "Call Type": ["Call Type"],
+        "Pending Reason": ["Pending Reason", "PendingReason", "Reason for Pendency", "Pendency Reason"],
         "Product": ["Product"],
         "Model": ["Model"],
         "Customer Code": ["Customer Code"],
@@ -664,6 +666,47 @@ def _latest_by_type(reports: List[Dict[str, Any]], report_type: str, on_or_befor
     return sorted(items, key=lambda r: (r["snapshot_dt"], r["upload_order"]))[-1] if items else None
 
 
+
+def _pendency_reason_outputs(pending_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Summarise recorded pendency reasons from one row per active ticket.
+
+    Shares use only tickets with a recorded reason as denominator. Reason coverage is
+    shown separately against all active tickets so sparse data cannot be misrepresented.
+    """
+    total_tickets = int(len(pending_df)) if pending_df is not None else 0
+    reason_col = find_col(
+        pending_df if pending_df is not None else pd.DataFrame(),
+        ["Pending Reason", "PendingReason", "Reason for Pendency", "Pendency Reason"],
+    )
+    empty = pd.DataFrame(columns=["Reason", "Tickets", "Share of Recorded Reasons (%)"])
+    if pending_df is None or pending_df.empty or not reason_col:
+        return empty, {
+            "total_tickets": total_tickets, "recorded_reason_tickets": 0,
+            "unrecorded_reason_tickets": total_tickets, "coverage_pct": 0.0,
+            "reason_col_available": bool(reason_col),
+        }
+    values = pending_df[reason_col].map(clean_text)
+    # Treat common placeholders as not recorded, not as real reasons.
+    placeholders = {"", "-", "--", "na", "n/a", "none", "null", "not available", "not specified", "unknown"}
+    valid_mask = values.map(lambda value: norm(value) not in {norm(x) for x in placeholders})
+    valid = values[valid_mask]
+    counts = valid.value_counts()
+    recorded = int(valid_mask.sum())
+    summary = pd.DataFrame({"Reason": counts.index.astype(str), "Tickets": counts.values.astype(int)})
+    if not summary.empty and recorded:
+        summary["Share of Recorded Reasons (%)"] = (summary["Tickets"] * 100.0 / recorded).round(1)
+        summary = summary.sort_values(["Tickets", "Reason"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    else:
+        summary = empty.copy()
+    return summary, {
+        "total_tickets": total_tickets,
+        "recorded_reason_tickets": recorded,
+        "unrecorded_reason_tickets": max(0, total_tickets - recorded),
+        "coverage_pct": round(100.0 * recorded / total_tickets, 1) if total_tickets else 0.0,
+        "reason_col_available": True,
+    }
+
+
 def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date] = None) -> Dict[str, Any]:
     pending_reports = sorted(
         [r for r in reports if r["report_type"] == "pending_calls"],
@@ -683,8 +726,8 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
 
     current_type_rows = filter_pending_call_types(current["df"])
     current_ticket_df, current_eligible_rows, current_exclusion_stats = active_pending_data(current, reports)
-    # Pending Reason is intentionally excluded from analysis: it is often blank/inconsistent in source exports.
-    current_ticket_df = current_ticket_df.drop(columns=[c for c in current_ticket_df.columns if norm(c) == "pendingreason"], errors="ignore")
+    # Keep recorded Pending Reason values for a transparent distribution chart. Blank reasons
+    # are tracked separately and never assigned an inferred category.
     priorities = enrich_pending(current_ticket_df, current["snapshot_dt"])
     top20 = priorities.head(20).copy()
     executive_name_col = find_col(top20, ["Service Executive Name"])
@@ -828,6 +871,7 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
     status_summary = priorities[status_col].map(lambda v: clean_text(v) or "Unspecified").value_counts().rename_axis("Status").reset_index(name="Unique Tickets") if status_col else pd.DataFrame(columns=["Status", "Unique Tickets"])
     call_type_col = find_col(priorities, ["Call Type"])
     call_type_summary = priorities[call_type_col].map(lambda v: clean_text(v) or "Unspecified").value_counts().rename_axis("Call Type").reset_index(name="Unique Tickets") if call_type_col else pd.DataFrame(columns=["Call Type", "Unique Tickets"])
+    pendency_reason_summary, pendency_reason_metrics = _pendency_reason_outputs(priorities)
     franchise_col = find_col(priorities, ["Franchise Name"])
     if franchise_col:
         _fr = priorities.copy()
@@ -972,6 +1016,8 @@ def analyze_reports(reports: List[Dict[str, Any]], analysis_date: Optional[date]
         "closed_count": closed_count,
         "status_summary": status_summary,
         "call_type_summary": call_type_summary,
+        "pendency_reason_summary": pendency_reason_summary,
+        "pendency_reason_metrics": pendency_reason_metrics,
         "franchise_summary": franchise_summary,
         "executive_summary": executive_summary,
         "age_summary": age_summary,
@@ -1041,6 +1087,91 @@ def _simple_counts(df: pd.DataFrame, source_col_aliases: Sequence[str], output_c
         return pd.DataFrame(columns=[output_col, "Unique Tickets"])
     vals = df[col].map(lambda v: clean_text(v) or "Unspecified")
     return vals.value_counts().rename_axis(output_col).reset_index(name="Unique Tickets")
+
+
+def _service_ambassador_productivity(
+    reports: List[Dict[str, Any]], franchise_name: str, analysis_date: date
+) -> Tuple[pd.DataFrame, str]:
+    """Count distinct completed/soft-closed tickets per technician for a franchise.
+
+    Uses only a Soft Closure (All Status) report whose declared period covers the
+    selected analysis date. A completion must have a resolved/closed status and a
+    valid (non-1900-placeholder) closure timestamp. Ticket IDs are de-duplicated
+    before counting so component/spare rows cannot inflate ambassador productivity.
+    """
+    empty = pd.DataFrame(columns=["Service Ambassador", "Calls Done", "Share (%)"])
+    candidates = []
+    for report in reports or []:
+        if report.get("report_type") != "soft_closure":
+            continue
+        start, end = report.get("period_start"), report.get("period_end")
+        if start is not None and end is not None:
+            if start.date() <= analysis_date <= end.date():
+                candidates.append(report)
+        elif pd.Timestamp(report.get("snapshot_dt")).date() == analysis_date:
+            candidates.append(report)
+    if not candidates:
+        return empty, "No Soft Closure report covers the selected report date."
+
+    report = sorted(candidates, key=lambda r: (r.get("snapshot_dt"), r.get("upload_order", 0)))[-1]
+    df = report.get("df", pd.DataFrame()).copy()
+    if df.empty:
+        return empty, "The selected Soft Closure report contains no rows."
+
+    franchise_col = find_col(df, ["Franchise Name", "FrName", "Franchise"])
+    ticket_col = get_ticket_col(df)
+    tech_col = find_col(df, ["Service Ambassador", "Service Ambassador Name", "Technician Name", "Technician"])
+    status_col = find_col(df, ["Status", "Call Status"])
+    if not franchise_col or not ticket_col or not tech_col or not status_col:
+        return empty, "The Soft Closure report is missing franchise, ticket, technician or status columns."
+
+    scoped = df.loc[df[franchise_col].map(norm) == norm(franchise_name)].copy()
+    if scoped.empty:
+        return empty, "No Soft Closure rows match this franchise in the selected report period."
+
+    # Prefer the soft-closure event timestamp; fall back to a genuine closed date.
+    event_col = find_col(scoped, ["Soft Closure Date", "Soft Closed Date", "SoftClosureDate"])
+    event_ts = (_valid_datetime_series(scoped[event_col]) if event_col else
+                pd.Series(pd.NaT, index=scoped.index, dtype="datetime64[ns]"))
+    closed_col = find_col(scoped, ["ClosedDate", "Closed Date", "Closed Time", "Closed Timestamp"])
+    if closed_col:
+        event_ts = event_ts.fillna(_valid_datetime_series(scoped[closed_col]))
+    scoped["_completion_timestamp"] = event_ts
+    status_values = scoped[status_col].map(norm)
+    completed = status_values.map(lambda v: ("resolved" in v) or ("closed" in v) or ("completed" in v))
+    scoped = scoped.loc[completed & scoped["_completion_timestamp"].notna()].copy()
+    if scoped.empty:
+        period = report.get("metadata") or f"{analysis_date:%d %b %Y}"
+        return empty, f"No resolved/closed calls with valid closure timestamps were found for {period}."
+
+    # Restrict events to the report's declared date range (inclusive by date, as these
+    # exports commonly show midnight as the end-time even for a full-day report).
+    period_start, period_end = report.get("period_start"), report.get("period_end")
+    if period_start is not None and period_end is not None:
+        dates = scoped["_completion_timestamp"].dt.date
+        scoped = scoped.loc[(dates >= period_start.date()) & (dates <= period_end.date())].copy()
+    else:
+        dates = scoped["_completion_timestamp"].dt.date
+        scoped = scoped.loc[dates == analysis_date].copy()
+    if scoped.empty:
+        return empty, "No completed calls fall inside the Soft Closure report period."
+
+    # One ticket contributes once. If multiple rows exist, attribute it to the most
+    # recent recorded closure event (stable source order for timestamp ties).
+    scoped["_ticket_key"] = scoped[ticket_col].map(clean_text)
+    scoped["_technician"] = scoped[tech_col].map(lambda v: clean_text(v) or "Unspecified")
+    scoped = scoped.loc[scoped["_ticket_key"] != ""].sort_values("_completion_timestamp", kind="stable")
+    scoped = scoped.drop_duplicates(subset=["_ticket_key"], keep="last")
+    if scoped.empty:
+        return empty, "No distinct completed ticket numbers were available for productivity analysis."
+
+    summary = scoped.groupby("_technician", dropna=False).agg(**{"Calls Done": ("_ticket_key", "nunique")}).reset_index()
+    summary = summary.rename(columns={"_technician": "Service Ambassador"})
+    total = int(summary["Calls Done"].sum())
+    summary["Share (%)"] = (summary["Calls Done"] * 100.0 / total).round(1) if total else 0.0
+    summary = summary.sort_values(["Calls Done", "Service Ambassador"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    period_label = report.get("metadata") or f"{analysis_date:%d %b %Y}"
+    return summary, f"Resolved/soft-closed unique tickets · {period_label}"
 
 
 def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selection: str = "") -> Dict[str, Any]:
@@ -1193,6 +1324,7 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
     # Scoped status, call type, age-band and franchise/executive/technician summaries.
     scoped["status_summary"] = _simple_counts(priorities, ["Status"], "Status")
     scoped["call_type_summary"] = _simple_counts(priorities, ["Call Type"], "Call Type")
+    scoped["pendency_reason_summary"], scoped["pendency_reason_metrics"] = _pendency_reason_outputs(priorities)
     scoped["age_summary"] = pd.cut(
         priorities["Days Old"], bins=[-1, 0, 2, 6, 13, 29, float("inf")],
         labels=["0 days", "1–2 days", "3–6 days", "7–13 days", "14–29 days", "30+ days"],
@@ -1242,6 +1374,20 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
         ).reset_index().sort_values(["Pending Tickets", "Aged 7+ Days"], ascending=False, kind="stable").reset_index(drop=True)
     else:
         scoped["technician_summary"] = pd.DataFrame(columns=["Technician", "Pending Tickets", "Aged >2 Days", "Aged 7+ Days"])
+
+    # Franchise-specific output: count completed calls by service ambassador from the
+    # uploaded Soft Closure report, separately from current pending workload.
+    if mode == "franchise":
+        productivity, productivity_note = _service_ambassador_productivity(
+            analysis.get("reports", []), clean_text(selection), analysis.get("analysis_date", date.today())
+        )
+        scoped["service_ambassador_productivity"] = productivity
+        scoped["service_ambassador_productivity_note"] = productivity_note
+    else:
+        scoped["service_ambassador_productivity"] = pd.DataFrame(
+            columns=["Service Ambassador", "Calls Done", "Share (%)"]
+        )
+        scoped["service_ambassador_productivity_note"] = ""
 
     # Exclusion call types within the selected scope.
     source_all = current.get("df", pd.DataFrame())
@@ -1491,7 +1637,7 @@ def make_priority_png(analysis: Dict[str, Any]) -> bytes:
 
 
 def make_management_png(analysis: Dict[str, Any]) -> bytes:
-    """Create a high-contrast management image whose charts adapt to the selected view."""
+    """Create a cleaner one-page management report with honest pendency-reason coverage."""
     import matplotlib.pyplot as plt
     import numpy as np
     import textwrap
@@ -1501,81 +1647,92 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     amber = "#C78318"
     red = "#B9363E"
     green = "#237A55"
+    blue = "#3A78A5"
     ink = "#263746"
-    muted = "#435365"
+    muted = "#526170"
     grid = "#E3E8ED"
     page = "#F3F6F8"
     mode = analysis.get("scope_mode", "branch")
     selection = clean_text(analysis.get("scope_selection", ""))
 
-    fig = plt.figure(figsize=(16, 11), dpi=180, facecolor=page)
+    fig = plt.figure(figsize=(16, 10.5), dpi=180, facecolor=page)
     if mode == "franchise":
         heading = "SERVICE OPERATIONS | FRANCHISE DAILY UPDATE"
         scope_subtitle = f"Franchise: {selection}"
     elif mode == "executive":
         heading = "SERVICE OPERATIONS | EXECUTIVE DAILY BRIEF"
-        scope_subtitle = f"Service Executive: {selection} · All assigned franchise queues"
+        scope_subtitle = f"Service Executive: {selection} · Assigned franchise queues"
     else:
         heading = "SERVICE OPERATIONS | DAILY MANAGEMENT BRIEF"
         scope_subtitle = "Hyderabad Branch"
-    fig.text(0.04, 0.962, heading, fontsize=19, weight="bold", color=navy, va="top")
-    fig.text(0.04, 0.923,
-             f"{scope_subtitle}  ·  Report date {_date_label(analysis['analysis_date'])}  ·  {_snapshot_status(analysis)}",
-             fontsize=9.8, color=muted, va="top")
-    snap = analysis["current_pending_report"]["snapshot_dt"]
-    fig.text(0.96, 0.962, f"AS OF {snap.strftime('%d %b %Y  %I:%M %p')}",
-             fontsize=9.3, weight="bold", color=teal, ha="right", va="top")
 
-    current = analysis["current_unique_tickets"]
-    mc = analysis["movement_counts"]
-    css_rounded = analysis["csat_metrics"].get("css_pct_rounded")
+    snap = analysis["current_pending_report"]["snapshot_dt"]
+    fig.text(0.04, 0.963, heading, fontsize=18.5, weight="bold", color=navy, va="top")
+    fig.text(0.04, 0.923,
+             f"{scope_subtitle}  ·  {_date_label(analysis['analysis_date'])}  ·  {_snapshot_status(analysis)}",
+             fontsize=9.2, color=muted, va="top")
+    fig.text(0.96, 0.963, f"AS OF {snap.strftime('%d %b %Y  %I:%M %p')}",
+             fontsize=9.1, weight="bold", color=teal, ha="right", va="top")
+
+    current = int(analysis["current_unique_tickets"])
+    css_rounded = analysis.get("csat_metrics", {}).get("css_pct_rounded")
+    aged_over_2 = int(analysis.get("scope_summary", {}).get(
+        "aged_over_2", (analysis.get("priorities", pd.DataFrame()).get("Days Old", pd.Series(dtype=float)) > 2).sum()
+    ))
+    older_7 = int(analysis.get("older_7", 0))
+    reasons_meta = analysis.get("pendency_reason_metrics", {})
+    reason_cov = float(reasons_meta.get("coverage_pct", 0.0) or 0.0)
     kpis = [
-        ("PENDING TICKETS", f"{current:,}", navy),
-        ("AGED 7+ DAYS", f"{analysis['older_7']:,}", amber),
-        ("ESCALATED", f"{analysis['escalated']:,}", red),
-        ("REPEAT FLAGS", f"{analysis['repeat_calls']:,}", teal),
-        ("NEW IN LATEST SNAPSHOT", f"{mc['new']:,}" if analysis["previous_pending_report"] else "—", "#2E6D9C"),
+        ("ACTIVE PENDING", f"{current:,}", navy),
+        ("AGED >2 DAYS", f"{aged_over_2:,}", amber),
+        ("AGED 7+ DAYS", f"{older_7:,}", red),
         ("CSS", f"{css_rounded}%" if css_rounded is not None else "—", green),
     ]
-    x0, step, card_w = 0.04, 0.155, 0.143
-    for i, (label, value, value_color) in enumerate(kpis):
-        x = x0 + i * step
-        fig.patches.append(plt.Rectangle((x, 0.817), card_w, 0.078, transform=fig.transFigure,
-                                         facecolor="#FFFFFF", edgecolor="#D8E0E7", linewidth=1.0, zorder=0))
-        fig.text(x + 0.010, 0.868, label, fontsize=7.1, color=muted, weight="bold", va="center")
-        fig.text(x + 0.010, 0.835, value, fontsize=17, color=value_color, weight="bold", va="center")
+    card_xs = [0.04, 0.275, 0.51, 0.745]
+    for x, (label, value, value_color) in zip(card_xs, kpis):
+        fig.patches.append(plt.Rectangle((x, 0.825), 0.215, 0.073, transform=fig.transFigure,
+                                         facecolor="#FFFFFF", edgecolor="#D8E0E7", linewidth=0.9, zorder=-10))
+        fig.text(x + 0.012, 0.872, label, fontsize=8.0, color=muted, weight="bold", va="center")
+        fig.text(x + 0.012, 0.842, value, fontsize=17, color=value_color, weight="bold", va="center")
 
-    def style_axis(ax, title, title_size=11.2):
+    def style_axis(ax, title, title_size=10.3):
         ax.set_facecolor("#FFFFFF")
-        ax.set_title(title, loc="left", color=navy, fontsize=title_size, fontweight="bold", pad=9)
-        ax.tick_params(axis="both", labelsize=8.0, colors=ink, length=0, pad=4)
-        ax.grid(axis="x", color=grid, linewidth=0.7)
+        ax.set_title(title, loc="left", color=navy, fontsize=title_size, fontweight="bold", pad=7)
+        ax.tick_params(axis="both", labelsize=7.7, colors=ink, length=0, pad=3)
+        ax.grid(axis="x", color=grid, linewidth=0.65)
         ax.set_axisbelow(True)
         for spine in ax.spines.values():
             spine.set_visible(False)
 
-    def draw_hbar(ax, frame, label_col, value_col, title, share_col=None, max_rows=5):
+    def empty_axis(ax, title, note="No matching data available for this view."):
+        ax.clear()
+        ax.set_facecolor("#FFFFFF")
+        ax.axis("off")
+        ax.set_title(title, loc="left", color=navy, fontsize=10.3, fontweight="bold", pad=7)
+        ax.text(0.02, 0.50, note, color=muted, fontsize=8.8, transform=ax.transAxes, va="center")
+
+    def draw_hbar(ax, frame, label_col, value_col, title, share_col=None, max_rows=5, label_wrap=23):
         df = frame.copy() if frame is not None else pd.DataFrame()
         if df.empty or label_col not in df.columns or value_col not in df.columns:
-            ax.axis("off")
-            ax.text(0.03, 0.5, "No matching data available for this view.", color=muted,
-                    fontsize=9, transform=ax.transAxes, va="center")
-            ax.set_title(title, loc="left", color=navy, fontsize=11.2, fontweight="bold", pad=9)
+            empty_axis(ax, title)
             return
         df[value_col] = pd.to_numeric(df[value_col], errors="coerce").fillna(0)
-        df = df.sort_values(value_col, ascending=False, kind="stable").head(max_rows).copy()
+        df = df.loc[df[value_col] > 0].sort_values(value_col, ascending=False, kind="stable").head(max_rows).copy()
+        if df.empty:
+            empty_axis(ax, title, "No records to display.")
+            return
         df[label_col] = df[label_col].map(lambda x: clean_text(x) or "Unspecified")
-        labels = [textwrap.fill(v, width=24, break_long_words=False) for v in df[label_col].astype(str)]
+        labels = [textwrap.fill(v, width=label_wrap, break_long_words=False) for v in df[label_col].astype(str)]
         vals = df[value_col].to_numpy(dtype=float)
         y = np.arange(len(df))
-        ax.barh(y, vals, color="#3A78A5", height=0.58)
+        ax.barh(y, vals, color=blue, height=0.57)
         ax.set_yticks(y)
-        ax.set_yticklabels(labels, fontsize=7.6, color=ink)
+        ax.set_yticklabels(labels, fontsize=7.5, color=ink)
         ax.invert_yaxis()
         style_axis(ax, title)
-        ax.tick_params(axis="y", labelsize=7.6, colors=ink, pad=4)
-        xmax = max(float(vals.max()), 1)
-        ax.set_xlim(0, xmax * 1.38)
+        ax.tick_params(axis="y", labelsize=7.5, colors=ink, pad=4)
+        xmax = max(float(vals.max()), 1.0)
+        ax.set_xlim(0, xmax * 1.48)
         if share_col and share_col in df.columns:
             shares = pd.to_numeric(df[share_col], errors="coerce").fillna(0).to_numpy(dtype=float)
         else:
@@ -1583,133 +1740,167 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
             shares = vals * 100.0 / total
         for yy, val, share in zip(y, vals, shares):
             ax.text(val + xmax * 0.025, yy, f"{int(val):,}  ·  {share:.1f}%", va="center", ha="left",
-                    fontsize=7.4, color=ink, weight="bold")
+                    fontsize=7.3, color=ink, weight="bold")
 
-    # Top-left: ageing always reflects the queue represented by the current view.
-    ax_age = fig.add_axes([0.075, 0.545, 0.37, 0.205])
-    age = analysis["age_summary"].copy()
-    if not age.empty:
+    # Four evenly spaced panels: age, reasons, view-specific operations, feedback.
+    # White cards and consistent margins reduce visual clutter and prevent text/chart collisions.
+    panels = [(0.04, 0.515, 0.445, 0.265), (0.515, 0.515, 0.445, 0.265),
+              (0.04, 0.275, 0.445, 0.220), (0.515, 0.275, 0.445, 0.220)]
+    for x, y, w, h in panels:
+        fig.patches.append(plt.Rectangle((x, y), w, h, transform=fig.transFigure,
+                                         facecolor="#FFFFFF", edgecolor="#D9E1E7", linewidth=0.9, zorder=-10))
+
+    # Panel 1 — ageing.
+    ax_age = fig.add_axes([0.105, 0.545, 0.345, 0.19])
+    age = analysis.get("age_summary", pd.DataFrame()).copy()
+    if not age.empty and {"Age Bucket", "Unique Tickets"}.issubset(age.columns):
         age["Unique Tickets"] = pd.to_numeric(age["Unique Tickets"], errors="coerce").fillna(0)
-        age_colors = ["#A8BAC8", "#8AA9BC", "#648EA8", "#2E8588", "#D39A35", "#B94842"]
-        ax_age.barh(age["Age Bucket"].astype(str), age["Unique Tickets"], color=age_colors[:len(age)], height=0.62)
+        labels = age["Age Bucket"].astype(str).tolist()
+        vals = age["Unique Tickets"].to_numpy(dtype=float)
+        yy = np.arange(len(age))
+        palette = ["#A8BAC8", "#8AA9BC", "#648EA8", "#2E8588", "#D39A35", "#B94842"]
+        ax_age.barh(yy, vals, color=palette[:len(vals)], height=0.61)
+        ax_age.set_yticks(yy)
+        ax_age.set_yticklabels(labels, fontsize=7.6, color=ink)
         ax_age.invert_yaxis()
         style_axis(ax_age, "Pending backlog by age")
-        ax_age.tick_params(axis="y", labelsize=8.4, colors=ink)
-        xmax = max(float(age["Unique Tickets"].max()), 1)
-        ax_age.set_xlim(0, xmax * 1.14)
-        for y, val in enumerate(age["Unique Tickets"].to_numpy()):
-            ax_age.text(val + xmax * 0.015, y, f"{int(val):,}", va="center", ha="left", fontsize=8.1, color=ink, weight="bold")
-        ax_age.grid(axis="y", visible=False)
+        xmax = max(float(vals.max()) if len(vals) else 0, 1.0)
+        ax_age.set_xlim(0, xmax * 1.18)
+        for yv, val in zip(yy, vals):
+            ax_age.text(val + xmax * 0.018, yv, f"{int(val):,}", va="center", ha="left", fontsize=7.6, color=ink, weight="bold")
     else:
-        ax_age.axis("off")
-        ax_age.text(0.03, 0.5, "No calls in this view.", color=muted, fontsize=10, transform=ax_age.transAxes, va="center")
+        empty_axis(ax_age, "Pending backlog by age", "No pending calls in this view.")
 
-    # Top-right chart adapts to the view: branch=executives, franchise=statuses, executive=franchises.
-    ax_main = fig.add_axes([0.575, 0.545, 0.35, 0.205])
+    # Panel 2 — recorded reasons only. Percentages use reason-recorded tickets as denominator.
+    ax_reason = fig.add_axes([0.605, 0.55, 0.315, 0.185])
+    reason_frame = analysis.get("pendency_reason_summary", pd.DataFrame()).copy()
+    reason_meta = analysis.get("pendency_reason_metrics", {})
+    reason_total = int(reason_meta.get("recorded_reason_tickets", 0) or 0)
+    reason_all = int(reason_meta.get("total_tickets", current) or 0)
+    reason_missing = int(reason_meta.get("unrecorded_reason_tickets", max(0, reason_all - reason_total)) or 0)
+    coverage = float(reason_meta.get("coverage_pct", 0.0) or 0.0)
+    if not reason_frame.empty and {"Reason", "Tickets"}.issubset(reason_frame.columns) and reason_total > 0:
+        reason_frame["Tickets"] = pd.to_numeric(reason_frame["Tickets"], errors="coerce").fillna(0)
+        reason_frame = reason_frame.loc[reason_frame["Tickets"] > 0].sort_values("Tickets", ascending=False, kind="stable")
+        if len(reason_frame) > 5:
+            top = reason_frame.head(4).copy()
+            other = reason_frame.iloc[4:]
+            other_count = int(other["Tickets"].sum())
+            other_pct = round(100.0 * other_count / reason_total, 1)
+            top = pd.concat([top, pd.DataFrame([{"Reason": "Other recorded reasons", "Tickets": other_count,
+                                                   "Share of Recorded Reasons (%)": other_pct}])], ignore_index=True)
+            reason_frame = top
+        if "Share of Recorded Reasons (%)" not in reason_frame.columns:
+            reason_frame["Share of Recorded Reasons (%)"] = reason_frame["Tickets"] * 100.0 / reason_total
+        reason_frame["Share of Recorded Reasons (%)"] = pd.to_numeric(
+            reason_frame["Share of Recorded Reasons (%)"], errors="coerce").fillna(0)
+        reason_frame = reason_frame.sort_values("Share of Recorded Reasons (%)", ascending=False, kind="stable")
+        reason_labels = [textwrap.fill(clean_text(v) or "Unspecified", width=23, break_long_words=False)
+                         for v in reason_frame["Reason"].astype(str)]
+        reason_shares = reason_frame["Share of Recorded Reasons (%)"].to_numpy(dtype=float)
+        reason_counts = reason_frame["Tickets"].to_numpy(dtype=int)
+        y_reason = np.arange(len(reason_frame))
+        ax_reason.barh(y_reason, reason_shares, color=blue, height=0.57)
+        ax_reason.set_yticks(y_reason)
+        ax_reason.set_yticklabels(reason_labels, fontsize=7.2, color=ink)
+        ax_reason.invert_yaxis()
+        style_axis(ax_reason, "Reason for pendency · share of recorded reasons", title_size=9.7)
+        ax_reason.tick_params(axis="y", labelsize=7.2, colors=ink, pad=3)
+        max_share = max(float(reason_shares.max()) if len(reason_shares) else 0, 1.0)
+        axis_limit = min(100.0, max_share * 1.65)
+        ax_reason.set_xlim(0, axis_limit)
+        ax_reason.set_xlabel("Share of recorded reasons (%)", fontsize=6.8, color=muted, labelpad=1)
+        for yv, share, count in zip(y_reason, reason_shares, reason_counts):
+            label = f"{share:.1f}%  ·  {count} ticket(s)"
+            if share >= axis_limit * 0.78:
+                ax_reason.text(share - max_share * 0.025, yv, label, va="center", ha="right",
+                               fontsize=6.8, color="#FFFFFF", weight="bold")
+            else:
+                ax_reason.text(share + max_share * 0.025, yv, label, va="center", ha="left",
+                               fontsize=7.0, color=ink, weight="bold")
+        ax_reason.text(0.0, -0.19,
+                       f"Reason recorded: {reason_total:,}/{reason_all:,} tickets ({coverage:.1f}%) · Not recorded: {reason_missing:,}",
+                       transform=ax_reason.transAxes, fontsize=6.8, color=muted, va="top", clip_on=False)
+    else:
+        empty_axis(ax_reason, "Reason for pendency", "No nonblank Pending Reason values in the selected queue.")
+        ax_reason.text(0.02, -0.11,
+                       f"Reason recorded: {reason_total:,}/{reason_all:,} tickets ({coverage:.1f}%) · Not recorded: {reason_missing:,}",
+                       transform=ax_reason.transAxes, fontsize=7.1, color=muted, va="top", clip_on=False)
+
+    # Panel 3 — context appropriate to the selected view. The branch executive chart remains on the Top 20 image.
+    ax_ops = fig.add_axes([0.105, 0.305, 0.345, 0.155])
     if mode == "franchise":
-        status_frame = analysis["status_summary"].copy()
-        draw_hbar(ax_main, status_frame, "Status", "Unique Tickets", "Franchise status update")
+        productivity_frame = analysis.get("service_ambassador_productivity", pd.DataFrame()).copy()
+        draw_hbar(ax_ops, productivity_frame, "Service Ambassador", "Calls Done",
+                  "Service Ambassador productivity · selected date", "Share (%)", max_rows=5, label_wrap=23)
     elif mode == "executive":
-        fr_frame = analysis["franchise_summary"].copy()
+        fr_frame = analysis.get("franchise_summary", pd.DataFrame()).copy()
         if len(fr_frame) > 1:
-            draw_hbar(ax_main, fr_frame, "Franchise", "Pending Tickets", "Your pending workload by franchise")
+            draw_hbar(ax_ops, fr_frame, "Franchise", "Pending Tickets", "Pending workload by franchise", max_rows=5)
         else:
-            status_frame = analysis["status_summary"].copy()
-            draw_hbar(ax_main, status_frame, "Status", "Unique Tickets", "Your call status mix")
+            status_frame = analysis.get("status_summary", pd.DataFrame()).copy()
+            draw_hbar(ax_ops, status_frame, "Status", "Unique Tickets", "Your pending calls by status", max_rows=5)
     else:
-        ex_frame = analysis.get("top20_executive_summary", pd.DataFrame()).copy()
-        draw_hbar(ax_main, ex_frame, "Executive", "Top 20 Calls", "Top 20 oldest calls by executive", "Share of Top 20 (%)")
-
-    # Bottom-left is also scoped: franchise updates show technicians; executive view uses status
-    # when they cover multiple franchises, or technician workload when they have a single franchise.
-    ax_secondary = fig.add_axes([0.105, 0.295, 0.36, 0.19])
-    if mode == "franchise":
-        tech_frame = analysis.get("technician_summary", pd.DataFrame()).copy()
-        draw_hbar(ax_secondary, tech_frame, "Technician", "Pending Tickets", "Technician follow-up workload")
-    elif mode == "executive":
-        if len(analysis["franchise_summary"]) > 1:
-            status_frame = analysis["status_summary"].copy()
-            draw_hbar(ax_secondary, status_frame, "Status", "Unique Tickets", "Your calls by status")
-        else:
-            tech_frame = analysis.get("technician_summary", pd.DataFrame()).copy()
-            draw_hbar(ax_secondary, tech_frame, "Technician", "Pending Tickets", "Technician follow-up workload")
-    else:
-        fr_frame = analysis["franchise_summary"].copy()
-        # This branch view includes only unique active pending tickets aged strictly more than 2 days.
+        fr_frame = analysis.get("franchise_summary", pd.DataFrame()).copy()
         if not fr_frame.empty and "Aged >2 Days" in fr_frame.columns:
             fr_frame["Aged >2 Days"] = pd.to_numeric(fr_frame["Aged >2 Days"], errors="coerce").fillna(0)
             fr_frame = fr_frame.loc[fr_frame["Aged >2 Days"] > 0]
-        draw_hbar(ax_secondary, fr_frame, "Franchise", "Aged >2 Days", "Franchise calls pending >2 days")
+        draw_hbar(ax_ops, fr_frame, "Franchise", "Aged >2 Days", "Franchises with calls aged >2 days", max_rows=5, label_wrap=22)
 
-    ax_feedback = fig.add_axes([0.575, 0.295, 0.35, 0.19])
-    csat_summary = analysis["csat_summary"].copy()
-    if not csat_summary.empty:
+    # Panel 4 — customer feedback mix, scoped only where the source has a matching franchise/executive field.
+    ax_feedback = fig.add_axes([0.595, 0.305, 0.33, 0.155])
+    csat_summary = analysis.get("csat_summary", pd.DataFrame()).copy()
+    if not csat_summary.empty and {"Feedback", "Share %"}.issubset(csat_summary.columns):
         order = {"HAPPY": 0, "OK": 1, "NOT HAPPY": 2}
         csat_summary["_ord"] = csat_summary["Feedback"].map(lambda x: order.get(clean_text(x).upper(), 3))
-        csat_summary = csat_summary.sort_values("_ord")
+        csat_summary = csat_summary.sort_values("_ord", kind="stable")
         labels = csat_summary["Feedback"].astype(str).str.upper().tolist()
-        vals = pd.to_numeric(csat_summary["Share %"], errors="coerce").fillna(0).tolist()
+        vals = pd.to_numeric(csat_summary["Share %"], errors="coerce").fillna(0).to_numpy(dtype=float)
         color_map = {"HAPPY": green, "OK": amber, "NOT HAPPY": red}
-        bars = ax_feedback.bar(labels, vals, color=[color_map.get(x, "#8A9BA9") for x in labels], width=0.55)
+        bars = ax_feedback.bar(labels, vals, color=[color_map.get(x, "#8A9BA9") for x in labels], width=0.56)
         feedback_title = "Customer feedback mix" if mode == "branch" else "Customer feedback for this view"
         style_axis(ax_feedback, feedback_title)
-        ax_feedback.set_ylim(0, max(100, max(vals, default=0) * 1.17))
-        ax_feedback.tick_params(axis="x", labelsize=8.0, colors=ink, pad=5)
-        ax_feedback.tick_params(axis="y", labelsize=7.8, colors=ink)
+        ax_feedback.set_ylim(0, max(100.0, float(vals.max()) * 1.18 if len(vals) else 100.0))
+        ax_feedback.tick_params(axis="x", labelsize=7.8, colors=ink, pad=4)
+        ax_feedback.tick_params(axis="y", labelsize=7.2, colors=ink)
         ax_feedback.grid(axis="x", visible=False)
         for bar, val in zip(bars, vals):
-            ax_feedback.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
-                             f"{val:.1f}%", ha="center", va="bottom", fontsize=8.5, color=ink, weight="bold")
+            ax_feedback.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1.5, f"{val:.1f}%",
+                             ha="center", va="bottom", fontsize=7.8, color=ink, weight="bold")
     else:
-        ax_feedback.axis("off")
-        title = "No customer feedback matched this view" if mode != "branch" and not analysis.get("csat_scope_supported", True) else "No Customer Satisfaction report uploaded for this view"
-        ax_feedback.text(0.03, 0.5, title, transform=ax_feedback.transAxes, color=muted, fontsize=9, va="center")
-        ax_feedback.set_title("Customer feedback", loc="left", color=navy, fontsize=11.2, fontweight="bold", pad=9)
+        missing_note = ("No matching customer feedback for this view." if mode != "branch" and not analysis.get("csat_scope_supported", True)
+                        else "No Customer Satisfaction report available.")
+        empty_axis(ax_feedback, "Customer feedback mix", missing_note)
 
-    # Bottom information panel: readable line lengths with separate movement and data-quality columns.
-    fig.patches.append(plt.Rectangle((0.04, 0.045), 0.92, 0.20, transform=fig.transFigure,
-                                     facecolor="#FFFFFF", edgecolor="#D8E0E7", linewidth=1.0, zorder=0))
-    fig.text(0.055, 0.222, "SNAPSHOT MOVEMENT", fontsize=8.8, color=teal, weight="bold", va="center")
-    prev = analysis["previous_pending_report"]
-    if prev:
-        movement_text = (
-            f"Newly present: {mc['new']:,}  ·  Continuing: {mc['continuing']:,}\n"
-            f"No longer listed: {mc['missing']:,}  ·  Status changed: {mc['status_changed']:,}  ·  Age increased: {mc['age_increased']:,}"
-        )
+    # Compact footer: two columns with only the operational context a manager needs.
+    fig.patches.append(plt.Rectangle((0.04, 0.065), 0.92, 0.165, transform=fig.transFigure,
+                                     facecolor="#FFFFFF", edgecolor="#D8E0E7", linewidth=0.9, zorder=0))
+    mc = analysis.get("movement_counts", {})
+    fig.text(0.055, 0.202, "SNAPSHOT MOVEMENT", fontsize=8.0, color=teal, weight="bold", va="center")
+    if analysis.get("previous_pending_report"):
+        movement = (f"New: {int(mc.get('new', 0)):,}  ·  Continuing: {int(mc.get('continuing', 0)):,}  ·  "
+                    f"No longer listed: {int(mc.get('missing', 0)):,}")
     else:
-        movement_text = "Only one Pending Call snapshot was uploaded; hourly movement cannot yet be calculated."
-    fig.text(0.055, 0.199, textwrap.fill(movement_text, width=78), fontsize=8.1, color=ink, va="top", linespacing=1.45)
-    fig.text(0.055, 0.145, "A call absent from a later snapshot is not proof of closure.", fontsize=7.9, color=red, va="top")
-    status_counts = analysis["status_summary"].head(4)
-    status_line = "Status mix: " + "  ·  ".join(
-        f"{clean_text(row['Status']) or 'Unspecified'} {int(row['Unique Tickets']):,}" for _, row in status_counts.iterrows()
-    ) if not status_counts.empty else "Status mix: not available"
-    fig.text(0.055, 0.118, textwrap.fill(status_line, width=80), fontsize=7.8, color=muted, va="top")
+        movement = "Upload a previous snapshot to compare hourly movement."
+    fig.text(0.055, 0.176, textwrap.fill(movement, width=70), fontsize=8.0, color=ink, va="top")
+    fig.text(0.055, 0.126, "A call absent from a later snapshot is not proof of closure.", fontsize=7.5, color=red, va="top")
 
-    fig.lines.append(plt.Line2D([0.655, 0.655], [0.065, 0.225], transform=fig.transFigure, color="#E0E6EB", linewidth=1.0))
-    fig.text(0.675, 0.222, "DATA QUALITY & COVERAGE", fontsize=8.8, color=teal, weight="bold", va="center")
-    dq = analysis["data_quality_metrics"]
-    dq_text = (
-        f"Missing executive: {dq['missing_executive']:,}  ·  Missing technician: {dq['missing_technician']:,}\n"
-        f"Missing ticket ID: {dq['missing_ticket_number']:,}  ·  Extra source rows: {dq['rows_beyond_distinct_tickets']:,}\n"
-        f"Excluded: {dq['soft_closed_tickets_excluded']:,} soft-closed + {dq['negative_response_tickets_excluded']:,} negative-response"
-    )
-    fig.text(0.675, 0.199, textwrap.fill(dq_text, width=57), fontsize=7.3, color=ink, va="top", linespacing=1.3)
-    reg = analysis["registered_count"]
-    if reg is not None:
-        reg_line = f"Calls registered: {reg:,} distinct tickets ({analysis['registered_date_coverage']})."
-        if analysis["closed_count"] is not None:
-            reg_line += f" Closure timestamps: {analysis['closed_count']:,}."
-    else:
-        reg_line = "Calls registered for selected date: unavailable from the uploaded report period or scope."
-    fig.text(0.675, 0.119, textwrap.fill(reg_line, width=57), fontsize=7.2, color=muted, va="top", linespacing=1.25)
-    fig.text(0.96, 0.020, "INTERNAL WORKING REPORT  ·  Verify source coverage before formal management circulation",
-             ha="right", va="center", fontsize=7.4, color="#435365")
+    fig.lines.append(plt.Line2D([0.51, 0.51], [0.085, 0.215], transform=fig.transFigure, color="#E0E6EB", linewidth=0.8))
+    fig.text(0.535, 0.202, "DATA NOTES", fontsize=8.0, color=teal, weight="bold", va="center")
+    dq = analysis.get("data_quality_metrics", {})
+    exclude_line = (f"Excluded from active queue: {int(dq.get('soft_closed_tickets_excluded', 0)):,} soft-closed, "
+                    f"{int(dq.get('negative_response_tickets_excluded', 0)):,} negative-response; Courtesy and Dealer Defective excluded.")
+    fig.text(0.535, 0.176, textwrap.fill(exclude_line, width=68), fontsize=7.7, color=ink, va="top")
+    source_line = f"Pending reasons are source-entered; {reason_missing:,} of {reason_all:,} active tickets have no reason recorded."
+    fig.text(0.535, 0.119, textwrap.fill(source_line, width=68), fontsize=7.6, color=muted, va="top")
+    fig.text(0.96, 0.027, "INTERNAL WORKING REPORT  ·  Snapshot-based figures; validate source coverage", 
+             ha="right", va="center", fontsize=7.2, color=muted)
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
     plt.close(fig)
     return buf.getvalue()
+
 
 
 def make_pdf(priority_png: bytes, management_png: bytes) -> bytes:
