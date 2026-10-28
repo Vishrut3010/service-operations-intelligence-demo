@@ -683,3 +683,21 @@ else:
             except Exception as exc:
                 st.error(f"Could not generate the selected executive view ({type(exc).__name__}). Try a different selection or check the app logs for details.")
 
+
+
+# Persistent prototype disclaimer at the bottom of every view.
+st.markdown(
+    """
+    <div style="margin-top:2.8rem; padding:1rem 1.2rem; border-top:1px solid #344657;
+                color:#B3C0CC; font-family:Arial, sans-serif; font-size:12px;
+                line-height:1.6; text-align:center;">
+      <span style="color:#EDF2F7; font-weight:700; letter-spacing:.04em;">PROTOTYPE DISCLAIMER</span>
+      <span style="padding:0 .45rem; color:#D6424E;">·</span>
+      This Service Operations Intelligence tool is a prototype developed by Vishrut
+      under the <strong style="color:#F3F6F9;">“To Branch With Love”</strong> project.
+      Outputs are intended to support operational review and should be verified against source reports
+      before decisions are made.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
