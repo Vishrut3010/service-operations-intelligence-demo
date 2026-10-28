@@ -166,21 +166,36 @@ def parse_report(filename: str, file_bytes: bytes, upload_order: int = 0) -> Dic
     if drop_cols:
         df = df.drop(columns=drop_cols)
     df = df.dropna(how="all").reset_index(drop=True)
-    # Prefer the report title/filename when an export has overlapping columns.
-    # Soft Closure exports can contain Call Book Date and status fields that overlap
-    # with Calls Registered; relying only on headers can misclassify the closure file,
-    # which then makes the SA productivity graph appear empty.
-    title_hint = norm(metadata + " " + filename)
+    # Prefer the actual report title printed inside the workbook, then the filename,
+    # then headers. Portal downloads are often given generic filenames such as
+    # report(3).xlsx. Soft Closure reports can share Call Book Date / Closed Time
+    # columns with Calls Registered, so ignoring the workbook title hides SA activity.
+    pre_header_text = " ".join(
+        clean_text(cell)
+        for row in preview.iloc[:header_idx].itertuples(index=False, name=None)
+        for cell in row if clean_text(cell)
+    )
+    title_hint_text = " ".join([pre_header_text, metadata, filename])
+    title_hint = norm(title_hint_text)
     if "softclosure" in title_hint or ("soft" in title_hint and "closure" in title_hint):
         report_type = "soft_closure"
-    elif "customersatisfaction" in title_hint or "customersatisfaction score" in title_hint:
+    elif "customersatisfaction" in title_hint:
         report_type = "customer_satisfaction"
     elif "callsregistered" in title_hint:
         report_type = "calls_registered"
     elif "pendingcall" in title_hint:
         report_type = "pending_calls"
     else:
-        report_type = _classify(df)
+        # If a generic-named export has no readable title, use a content-level
+        # closure signature before the more generic Calls Registered signature.
+        status_col_hint = find_col(df, ["Status", "Call Status"])
+        status_values_hint = (df[status_col_hint].map(norm) if status_col_hint else pd.Series(dtype=str))
+        has_soft_closure_rows = bool(status_values_hint.map(lambda v: "softclosure" in v or "resolvedsoftclosure" in v).any())
+        columns_hint = {norm(c) for c in df.columns}
+        if has_soft_closure_rows and ("softclosuredate" in columns_hint or "status" in columns_hint):
+            report_type = "soft_closure"
+        else:
+            report_type = _classify(df)
     if report_type == "unknown":
         raise ValueError("The file was read, but its report type could not be identified. Expected Pending Calls, Calls Registered, Soft Closure, or Customer Satisfaction.")
 
@@ -202,6 +217,7 @@ def parse_report(filename: str, file_bytes: bytes, upload_order: int = 0) -> Dic
         "df": df,
         "header_row_excel": header_idx + 1,
         "metadata": metadata,
+        "report_title": pre_header_text,
         "period_start": period_start,
         "period_end": period_end,
         "snapshot_dt": snapshot_dt,
@@ -1168,6 +1184,79 @@ def _simple_counts(df: pd.DataFrame, source_col_aliases: Sequence[str], output_c
     return vals.value_counts().rename_axis(output_col).reset_index(name="Unique Tickets")
 
 
+def _is_soft_closure_source(report: Dict[str, Any]) -> bool:
+    """Identify a Soft Closure export by report type, embedded title, filename or row signature.
+
+    Some CRM downloads are renamed to generic filenames, and date-range metadata alone
+    does not identify the report. This fallback inspects the original workbook title and
+    the actual status values so the SA graph can still use the correct source.
+    """
+    if report.get("report_type") == "soft_closure":
+        return True
+    hint = norm(" ".join([clean_text(report.get("filename", "")), clean_text(report.get("metadata", "")), clean_text(report.get("report_title", ""))]))
+    if "softclosure" in hint or ("soft" in hint and "closure" in hint):
+        return True
+    df = report.get("df", pd.DataFrame())
+    if df is None or df.empty:
+        return False
+    status_col = find_col(df, ["Status", "Call Status"])
+    event_col = find_col(df, ["Soft Closure Date", "Soft Closed Date", "SoftClosureDate", "Closure Date"])
+    ticket_col = get_ticket_col(df)
+    technician_col = find_col(df, ["Technician Name", "Service Ambassador", "Service Ambassador Name", "Technician"])
+    if not (status_col and event_col and ticket_col and technician_col):
+        return False
+    statuses = df[status_col].map(norm)
+    # This specific source status is strong evidence; don't classify a general call
+    # register as Soft Closure merely because it includes a Soft Closure Date column.
+    return bool(statuses.map(lambda value: "softclosure" in value).any())
+
+
+def _soft_closure_candidates_for_date(
+    reports: List[Dict[str, Any]], analysis_date: date, selected_report_order: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """Return closure reports with event evidence for the selected date, even if their
+    declared report period is inconsistent with the dated rows. Candidates with actual
+    closure events on the date are preferred over metadata-only candidates.
+    """
+    candidates = []
+    for report in reports or []:
+        if not _is_soft_closure_source(report):
+            continue
+        df = report.get("df", pd.DataFrame())
+        event_col = find_col(df, ["Soft Closure Date", "Soft Closed Date", "SoftClosureDate", "Closure Date"]) if not df.empty else None
+        closed_col = find_col(df, ["ClosedDate", "Closed Date", "Closed Time", "Closed Timestamp"]) if not df.empty else None
+        event_ts = (_valid_datetime_series(df[event_col]) if event_col else
+                    pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns]"))
+        if closed_col:
+            event_ts = event_ts.fillna(_valid_datetime_series(df[closed_col]))
+        status_col = find_col(df, ["Status", "Call Status"]) if not df.empty else None
+        if status_col:
+            statuses = df[status_col].map(norm)
+            is_completed = statuses.map(lambda v: ("resolved" in v) or ("closed" in v) or ("completed" in v))
+            event_on_date = bool((is_completed & event_ts.dt.date.eq(analysis_date)).any())
+        else:
+            event_on_date = False
+        start, end = report.get("period_start"), report.get("period_end")
+        metadata_covers = bool(start is not None and end is not None and start.date() <= analysis_date <= end.date())
+        if event_on_date or metadata_covers:
+            candidates.append((report, event_on_date))
+    if not candidates:
+        return []
+    # Prefer candidates with actual closed/completed rows on the selected day. If a
+    # specific report order was confirmed, honor it only when it has those date rows
+    # or its declared period covers the date.
+    if selected_report_order is not None:
+        selected = [r for r, has_event in candidates if int(r.get("upload_order", -1)) == int(selected_report_order)]
+        if selected:
+            selected_has_event = [r for r, has_event in candidates if int(r.get("upload_order", -1)) == int(selected_report_order) and has_event]
+            if selected_has_event:
+                return selected_has_event
+            return selected
+    event_candidates = [r for r, has_event in candidates if has_event]
+    pool = event_candidates or [r for r, _ in candidates]
+    return sorted(pool, key=_report_sort_key)
+
+
 def _service_ambassador_productivity(
     reports: List[Dict[str, Any]], franchise_name: str, analysis_date: date,
     selected_report_order: Optional[int] = None,
@@ -1180,21 +1269,14 @@ def _service_ambassador_productivity(
     before counting so component/spare rows cannot inflate ambassador productivity.
     """
     empty = pd.DataFrame(columns=["Service Ambassador", "Calls Done", "Share (%)"])
-    candidates = []
-    for report in reports or []:
-        if report.get("report_type") != "soft_closure":
-            continue
-        start, end = report.get("period_start"), report.get("period_end")
-        if start is not None and end is not None:
-            if start.date() <= analysis_date <= end.date():
-                candidates.append(report)
-        elif pd.Timestamp(report.get("snapshot_dt")).date() == analysis_date:
-            candidates.append(report)
+    candidates = _soft_closure_candidates_for_date(reports, analysis_date, selected_report_order)
     if not candidates:
-        return empty, "No Soft Closure report covers the selected report date."
+        available = [r for r in (reports or []) if _is_soft_closure_source(r)]
+        if not available:
+            return empty, "No Soft Closure workbook was detected. Upload the Excel containing the completed-call rows and Soft Closure Date."
+        return empty, f"A Soft Closure workbook was detected, but no completed rows have a valid closure timestamp on {analysis_date:%d %b %Y}. Check the report date or uploaded snapshot."
 
-    chosen = [r for r in candidates if selected_report_order is not None and int(r.get("upload_order", -1)) == int(selected_report_order)]
-    report = chosen[0] if chosen else max(candidates, key=_report_sort_key)
+    report = candidates[-1]
     df = report.get("df", pd.DataFrame()).copy()
     if df.empty:
         return empty, "The selected Soft Closure report contains no rows."
@@ -1275,20 +1357,13 @@ def _service_ambassador_target_hierarchy(
     ]
     empty = pd.DataFrame(columns=columns)
     mode = (scope_mode or "branch").strip().lower()
-    candidates = []
-    for report in reports or []:
-        if report.get("report_type") != "soft_closure":
-            continue
-        start, end = report.get("period_start"), report.get("period_end")
-        if start is not None and end is not None:
-            if start.date() <= analysis_date <= end.date():
-                candidates.append(report)
-        elif pd.Timestamp(report.get("snapshot_dt")).date() == analysis_date:
-            candidates.append(report)
+    candidates = _soft_closure_candidates_for_date(reports, analysis_date, selected_report_order)
     if not candidates:
-        return empty, "No Soft Closure report covers the selected date; daily SA target attainment is unavailable."
-    selected = [r for r in candidates if selected_report_order is not None and int(r.get("upload_order", -1)) == int(selected_report_order)]
-    report = selected[0] if selected else max(candidates, key=_report_sort_key)
+        available = [r for r in (reports or []) if _is_soft_closure_source(r)]
+        if not available:
+            return empty, "No Soft Closure workbook was detected. Upload the Excel containing completed-call rows and a Soft Closure Date."
+        return empty, f"A Soft Closure workbook was detected, but no completed rows have a valid closure timestamp on {analysis_date:%d %b %Y}. Check the report date or uploaded snapshot."
+    report = candidates[-1]
     source = report.get("df", pd.DataFrame()).copy()
     if source.empty:
         return empty, "The selected Soft Closure report contains no rows."
