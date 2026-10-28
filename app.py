@@ -695,8 +695,15 @@ st.markdown(
       <span style="padding:0 .45rem; color:#D6424E;">·</span>
       This Service Operations Intelligence tool is a prototype developed by Vishrut
       under the <strong style="color:#F3F6F9;">“To Branch With Love”</strong> project.
-      Outputs are intended to support operational review and should be verified against source reports
-      before decisions are made.
+    </div>
+    <div style="margin:0.5rem auto 0; max-width:1000px; padding:0.65rem 1rem;
+                border:1px solid #3A4A5B; border-radius:8px; background:#18232E;
+                color:#D5DEE7; font-family:Arial, sans-serif; font-size:11px;
+                line-height:1.55; text-align:center;">
+      <strong style="color:#F3F6F9;">DATA HANDLING &amp; PRIVACY</strong><br>
+      Uploaded files are sent to the server hosting this website and processed there; this hosted version does not process files only on your device.
+      The app does not intentionally save uploaded source files to a permanent database or file store, but report content and parsed results may be held temporarily in server memory/cache while the app runs.
+      Do not upload confidential company data unless this hosting arrangement is approved. For device-only processing, run the app locally on your own computer.
     </div>
     """,
     unsafe_allow_html=True,
