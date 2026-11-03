@@ -267,7 +267,21 @@ def get_ticket_col(df: pd.DataFrame) -> Optional[str]:
 # Call types excluded from the active-pending population in every view.
 # Markers are matched after normalization so spacing, punctuation and capitalization
 # differences in CRM exports do not change the exclusion.
-_EXCLUDED_PENDING_CALL_TYPE_MARKERS = ("courtesy", "dealerdefective", "reworkorder")
+# Rework Order is NOT excluded by default. Reconciliation against the approved branch
+# PivotTable showed that its 0/1/2-day ticket counts only reproduce when Rework Order
+# tickets stay in the active queue (7 tickets in the 3 Nov 2026 export). Set this flag
+# to True to restore the earlier exclusion; every view and export follows it.
+EXCLUDE_REWORK_ORDER = False
+_EXCLUDED_PENDING_CALL_TYPE_MARKERS = (
+    ("courtesy", "dealerdefective", "reworkorder") if EXCLUDE_REWORK_ORDER
+    else ("courtesy", "dealerdefective")
+)
+
+
+def excluded_call_type_label() -> str:
+    """Human-readable list of the call types currently excluded from the active queue."""
+    return ("Courtesy/Dealer Defective/Rework Order" if EXCLUDE_REWORK_ORDER
+            else "Courtesy/Dealer Defective")
 # Cancellation requests are recorded in Pending Reason in the standard CRM export,
 # not necessarily in Status. Match common wording variants after normalization.
 _EXCLUDED_PENDING_REASON_MARKERS = (
@@ -285,7 +299,7 @@ _EXCLUDED_PENDING_STATUS_MARKERS = {
 
 
 def excluded_pending_call_type_mask(df: pd.DataFrame) -> pd.Series:
-    """Return True for Courtesy, Dealer Defective and Rework Order source rows."""
+    """Return True for source rows whose call type is excluded (Courtesy, Dealer Defective; Rework Order only if EXCLUDE_REWORK_ORDER)."""
     call_type_col = find_col(df, ["Call Type", "CallType"])
     if call_type_col is None:
         return pd.Series(False, index=df.index, dtype=bool)
@@ -336,6 +350,60 @@ def distinct_ticket_count(df: pd.DataFrame) -> int:
     if not ticket_col:
         return len(df)
     return len({clean_text(v) for v in df[ticket_col].tolist() if clean_text(v)})
+
+
+def canonical_labels(series: pd.Series, blank: str = "Unspecified") -> pd.Series:
+    """Map names to one display label per case/space/punctuation-insensitive key.
+
+    "CHENDRA C", "Chendra C" and " chendra  c " group together. The label shown is the
+    most frequent spelling in the data (ties go to the first occurrence), so existing
+    displays keep their source wording while grouping no longer splits on case or spacing.
+    """
+    cleaned = series.map(clean_text)
+    keys = cleaned.map(norm)
+    frame = pd.DataFrame({"key": keys.to_numpy(), "label": cleaned.to_numpy(), "pos": range(len(cleaned))})
+    frame = frame[frame["key"].ne("")]
+    if frame.empty:
+        return pd.Series([blank] * len(series), index=series.index)
+    stats = frame.groupby(["key", "label"], sort=False, as_index=False).agg(n=("pos", "size"), first=("pos", "min"))
+    winners = (stats.sort_values(["key", "n", "first"], ascending=[True, False, True], kind="stable")
+                    .drop_duplicates("key", keep="first"))
+    mapping = dict(zip(winners["key"], winners["label"]))
+    return keys.map(lambda k: mapping.get(k, blank) if k else blank)
+
+
+AGE_PIVOT_COLUMNS = ["0 days", "1 day", "2 days", "3 days", "4+ days",
+                     "Grand Total", "More than 2 days", "More than 3 days"]
+
+
+def age_pivot(df: pd.DataFrame, group_aliases: Sequence[str], group_name: str) -> pd.DataFrame:
+    """Exact-day age pivot over one row per active ticket, mirroring the branch PivotTable.
+
+    Buckets are exact Days Old values (0, 1, 2, 3, then 4+). "More than 2 days" and
+    "More than 3 days" are separate threshold counts, not additional buckets. The unit
+    counted is the consolidated active ticket (one row per distinct Ticket No).
+    Pass group_aliases=[] for a single branch-level row.
+    """
+    cols = [group_name] + AGE_PIVOT_COLUMNS
+    if df is None or df.empty or "Days Old" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    work = pd.DataFrame({"Days": pd.to_numeric(df["Days Old"], errors="coerce").fillna(0).astype(int)})
+    gcol = find_col(df, list(group_aliases)) if group_aliases else None
+    work[group_name] = canonical_labels(df[gcol]).to_numpy() if gcol else "Hyderabad Branch"
+    work["0 days"] = (work["Days"] == 0).astype(int)
+    work["1 day"] = (work["Days"] == 1).astype(int)
+    work["2 days"] = (work["Days"] == 2).astype(int)
+    work["3 days"] = (work["Days"] == 3).astype(int)
+    work["4+ days"] = (work["Days"] >= 4).astype(int)
+    work["Grand Total"] = 1
+    work["More than 2 days"] = (work["Days"] > 2).astype(int)
+    work["More than 3 days"] = (work["Days"] > 3).astype(int)
+    out = work.groupby(group_name, sort=False)[AGE_PIVOT_COLUMNS].sum().reset_index()
+    out = out.sort_values(["Grand Total", group_name], ascending=[False, True], kind="stable").reset_index(drop=True)
+    if not gcol:
+        return out  # branch-level pivot is a single row; no separate Grand Total row needed
+    total = {group_name: "Grand Total", **{c: int(out[c].sum()) for c in AGE_PIVOT_COLUMNS}}
+    return pd.concat([out, pd.DataFrame([total])], ignore_index=True)
 
 
 def summarize_pending_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -541,6 +609,22 @@ def soft_closure_ticket_ids_as_of(reports: List[Dict[str, Any]], snapshot_dt: pd
     """Ticket IDs with a soft-closure event at or before the pending snapshot time."""
     closed_ids = set()
     for report in reports:
+        if report.get("report_type") == "calls_registered":
+            # Calls Registered exports carry Soft Closure Date and Status. A ticket counts as
+            # confirmed soft-closed only when the Status says so AND the closure timestamp is a
+            # real date (1900 placeholders ignored) at or before the pending snapshot. No
+            # period-based fallback is applied, so Negative Response / Re-Allocation tickets
+            # that merely carry a stray closure stamp stay in the active queue.
+            reg = report.get("df", pd.DataFrame())
+            reg_ticket = get_ticket_col(reg)
+            reg_soft = find_col(reg, ["Soft Closure Date", "Soft Closed Date", "SoftClosureDate"]) if not reg.empty else None
+            reg_status = find_col(reg, ["Status", "Call Status"]) if not reg.empty else None
+            if reg_ticket and reg_soft and reg_status:
+                stamps = _valid_datetime_series(reg[reg_soft])
+                confirmed = reg[reg_status].map(lambda v: "softclosure" in norm(v))
+                hit = confirmed & stamps.notna() & (stamps <= pd.Timestamp(snapshot_dt))
+                closed_ids.update(clean_text(v) for v in reg.loc[hit, reg_ticket].tolist() if clean_text(v))
+            continue
         if report.get("report_type") != "soft_closure":
             continue
         df = report.get("df", pd.DataFrame())
@@ -577,7 +661,8 @@ def soft_closure_ticket_ids_as_of(reports: List[Dict[str, Any]], snapshot_dt: pd
 def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str, Any]]] = None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """Return one row per active pending ticket plus its source rows and exclusion stats.
 
-    Exclusions: Courtesy, Dealer Defective and Rework Order call types; cancellation
+    Exclusions: Courtesy and Dealer Defective call types (plus Rework Order only when
+    EXCLUDE_REWORK_ORDER is set); cancellation
     requests recorded in Pending Reason; and tickets soft-closed at or before the
     snapshot timestamp. Negative Response and Request for Re-Allocation statuses remain
     in the active pending population. If any component row matches an exclusion, the
@@ -589,7 +674,7 @@ def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str,
     # component rows on each call. The key changes when closure reports change.
     soft_sig = tuple(sorted(
         (str(r.get("filename", "")), str(r.get("snapshot_dt", "")), int(r.get("rows", 0)))
-        for r in reports if r.get("report_type") == "soft_closure"
+        for r in reports if r.get("report_type") in ("soft_closure", "calls_registered")
     ))
     cache_key = (str(report.get("filename", "")), str(report.get("snapshot_dt", "")), soft_sig)
     cached = report.setdefault("_active_pending_cache", {}).get(cache_key)
@@ -636,8 +721,10 @@ def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str,
     # Keep exclusion categories mutually exclusive for management reconciliation.
     negative_only = negative_ids - soft_matched
     reallocation_only = reallocation_ids - soft_matched - negative_ids
-    excluded_ids = (excluded_call_type_ids | cancellation_request_ids | soft_matched |
-                    negative_ids | reallocation_ids)
+    # Negative Response and Request for Re-Allocation are retained, so they are never
+    # part of the exclusion set (the marker tuples are empty today; this keeps that true
+    # even if markers are ever added for reporting).
+    excluded_ids = excluded_call_type_ids | cancellation_request_ids | soft_matched
     active_ids = raw_ticket_ids - excluded_ids
 
     active_grouped = grouped[grouped[grouped_ticket_col].map(clean_text).isin(active_ids)].copy().reset_index(drop=True) if grouped_ticket_col else grouped.copy()
@@ -857,6 +944,71 @@ def _pendency_reason_outputs(pending_df: pd.DataFrame) -> Tuple[pd.DataFrame, Di
     }
 
 
+def _age_summary_frame(priorities: pd.DataFrame) -> pd.DataFrame:
+    """Exact-day bands (0, 1, 2, 3) matching the branch PivotTable, then 4-6 and 7+ days."""
+    days = _days_series(priorities) if len(priorities) else pd.Series([], dtype=int)
+    banded = pd.cut(days, bins=[-1, 0, 1, 2, 3, 6, float("inf")],
+                    labels=["0 days", "1 day", "2 days", "3 days", "4–6 days", "7+ days"])
+    return banded.value_counts(sort=False).rename_axis("Age Bucket").reset_index(name="Unique Tickets")
+
+
+_FRANCHISE_SUMMARY_COLUMNS = ["Franchise", "Pending Tickets", "Aged >2 Days", "Aged >3 Days", "Aged 7+ Days",
+                              "Escalated Tickets", "Repeat-call Flags", "Average Age (days)"]
+_EXECUTIVE_SUMMARY_COLUMNS = ["Executive", "Pending Tickets", "0 days", "1 day", "2 days", "3 days", "4+ days",
+                              "Aged >2 Days", "Aged >3 Days", "Aged 7+ Days", "Escalated Tickets",
+                              "Repeat-call Flags", "Overdue Scheduled", "Average Age (days)"]
+
+
+def _days_series(df: pd.DataFrame) -> pd.Series:
+    return pd.to_numeric(df["Days Old"], errors="coerce").fillna(0).astype(int)
+
+
+def _franchise_summary_frame(priorities: pd.DataFrame) -> pd.DataFrame:
+    """One row per franchise over distinct active tickets (case/space-insensitive grouping)."""
+    col = find_col(priorities, ["Franchise Name"])
+    if not col or priorities.empty:
+        return pd.DataFrame(columns=_FRANCHISE_SUMMARY_COLUMNS)
+    t = priorities.copy()
+    t["Franchise"] = canonical_labels(t[col]).to_numpy()
+    t["_d"] = _days_series(t)
+    out = t.groupby("Franchise", dropna=False).agg(
+        **{"Pending Tickets": ("Ticket No", "count"),
+           "Aged >2 Days": ("_d", lambda x: int((x > 2).sum())),
+           "Aged >3 Days": ("_d", lambda x: int((x > 3).sum())),
+           "Aged 7+ Days": ("_d", lambda x: int((x >= 7).sum())),
+           "Escalated Tickets": ("Has Escalation", lambda x: int(x.astype(bool).sum())),
+           "Repeat-call Flags": ("Is Repeat Call", lambda x: int(x.astype(bool).sum())),
+           "Average Age (days)": ("_d", lambda x: round(float(x.mean()), 1))}
+    ).reset_index()
+    return out.sort_values(["Aged >2 Days", "Pending Tickets"], ascending=False, kind="stable").reset_index(drop=True)[_FRANCHISE_SUMMARY_COLUMNS]
+
+
+def _executive_summary_frame(priorities: pd.DataFrame) -> pd.DataFrame:
+    """One row per executive over distinct active tickets, with exact-day buckets and thresholds."""
+    col = find_col(priorities, ["Service Executive Name"])
+    if not col or priorities.empty:
+        return pd.DataFrame(columns=_EXECUTIVE_SUMMARY_COLUMNS)
+    t = priorities.copy()
+    t["Executive"] = canonical_labels(t[col]).to_numpy()
+    t["_d"] = _days_series(t)
+    out = t.groupby("Executive", dropna=False).agg(
+        **{"Pending Tickets": ("Ticket No", "count"),
+           "0 days": ("_d", lambda x: int((x == 0).sum())),
+           "1 day": ("_d", lambda x: int((x == 1).sum())),
+           "2 days": ("_d", lambda x: int((x == 2).sum())),
+           "3 days": ("_d", lambda x: int((x == 3).sum())),
+           "4+ days": ("_d", lambda x: int((x >= 4).sum())),
+           "Aged >2 Days": ("_d", lambda x: int((x > 2).sum())),
+           "Aged >3 Days": ("_d", lambda x: int((x > 3).sum())),
+           "Aged 7+ Days": ("_d", lambda x: int((x >= 7).sum())),
+           "Escalated Tickets": ("Has Escalation", lambda x: int(x.astype(bool).sum())),
+           "Repeat-call Flags": ("Is Repeat Call", lambda x: int(x.astype(bool).sum())),
+           "Overdue Scheduled": ("Scheduled Overdue", lambda x: int(x.astype(bool).sum())),
+           "Average Age (days)": ("_d", lambda x: round(float(x.mean()), 1))}
+    ).reset_index()
+    return out.sort_values(["Pending Tickets", "Escalated Tickets"], ascending=False, kind="stable").reset_index(drop=True)[_EXECUTIVE_SUMMARY_COLUMNS]
+
+
 def analyze_reports(
     reports: List[Dict[str, Any]],
     analysis_date: Optional[date] = None,
@@ -898,7 +1050,7 @@ def analyze_reports(
     executive_name_col = find_col(top20, ["Service Executive Name"])
     if len(top20):
         if executive_name_col:
-            top20_executives = top20[executive_name_col].map(lambda v: clean_text(v) or "Unspecified")
+            top20_executives = canonical_labels(top20[executive_name_col])
         else:
             top20_executives = pd.Series(["Unspecified"] * len(top20), index=top20.index)
         top20_exec_counts = top20_executives.value_counts()
@@ -1037,37 +1189,9 @@ def analyze_reports(
     call_type_col = find_col(priorities, ["Call Type"])
     call_type_summary = priorities[call_type_col].map(lambda v: clean_text(v) or "Unspecified").value_counts().rename_axis("Call Type").reset_index(name="Unique Tickets") if call_type_col else pd.DataFrame(columns=["Call Type", "Unique Tickets"])
     pendency_reason_summary, pendency_reason_metrics = _pendency_reason_outputs(priorities)
-    franchise_col = find_col(priorities, ["Franchise Name"])
-    if franchise_col:
-        _fr = priorities.copy()
-        _fr["Franchise"] = _fr[franchise_col].map(lambda v: clean_text(v) or "Unspecified")
-        franchise_summary = _fr.groupby("Franchise", dropna=False).agg(
-            **{"Pending Tickets": ("Ticket No", "count"),
-               "Aged >2 Days": ("Days Old", lambda s: int((pd.to_numeric(s, errors="coerce").fillna(0) > 2).sum())),
-               "Aged 7+ Days": ("Days Old", lambda s: int((pd.to_numeric(s, errors="coerce").fillna(0) >= 7).sum())),
-               "Escalated Tickets": ("Has Escalation", lambda s: int(s.astype(bool).sum())),
-               "Repeat-call Flags": ("Is Repeat Call", lambda s: int(s.astype(bool).sum())),
-               "Average Age (days)": ("Days Old", lambda s: round(pd.to_numeric(s, errors="coerce").fillna(0).mean(), 1)),
-            }
-        ).reset_index().sort_values(["Aged >2 Days", "Pending Tickets"], ascending=False).reset_index(drop=True)
-    else:
-        franchise_summary = pd.DataFrame(columns=["Franchise", "Pending Tickets", "Aged >2 Days", "Aged 7+ Days", "Escalated Tickets", "Repeat-call Flags", "Average Age (days)"])
-    exec_col = find_col(priorities, ["Service Executive Name"])
-    if exec_col:
-        _work = priorities.copy()
-        _work["Executive"] = _work[exec_col].map(lambda v: clean_text(v) or "Unspecified")
-        executive_summary = _work.groupby("Executive", dropna=False).agg(
-            **{"Pending Tickets": ("Ticket No", "count"),
-               "Aged 7+ Days": ("Days Old", lambda s: int((pd.to_numeric(s, errors="coerce").fillna(0) >= 7).sum())),
-               "Escalated Tickets": ("Has Escalation", lambda s: int(s.astype(bool).sum())),
-               "Repeat-call Flags": ("Is Repeat Call", lambda s: int(s.astype(bool).sum())),
-               "Overdue Scheduled": ("Scheduled Overdue", lambda s: int(s.astype(bool).sum())),
-               "Average Age (days)": ("Days Old", lambda s: round(pd.to_numeric(s, errors="coerce").fillna(0).mean(), 1)),
-            }
-        ).reset_index().sort_values(["Pending Tickets", "Escalated Tickets"], ascending=False).reset_index(drop=True)
-    else:
-        executive_summary = pd.DataFrame(columns=["Executive", "Pending Tickets", "Aged 7+ Days", "Escalated Tickets", "Repeat-call Flags", "Overdue Scheduled", "Average Age (days)"])
-    age_summary = pd.cut(priorities["Days Old"], bins=[-1, 0, 2, 6, 13, 29, float("inf")], labels=["0 days", "1–2 days", "3–6 days", "7–13 days", "14–29 days", "30+ days"]).value_counts(sort=False).rename_axis("Age Bucket").reset_index(name="Unique Tickets")
+    franchise_summary = _franchise_summary_frame(priorities)
+    executive_summary = _executive_summary_frame(priorities)
+    age_summary = _age_summary_frame(priorities)
     escalated = int(priorities["Has Escalation"].astype(bool).sum())
     repeat_calls = int(priorities["Is Repeat Call"].astype(bool).sum())
     overdue_scheduled = int(priorities["Scheduled Overdue"].sum())
@@ -1125,7 +1249,7 @@ def analyze_reports(
                 "Rows beyond distinct tickets": max(0, len(active_rows) - len(active_grouped)),
                 "Period": r["metadata"], "Snapshot Used For": r["snapshot_dt"].strftime("%Y-%m-%d %H:%M"),
                 "Timestamp Basis": r["snapshot_source"],
-                "Note": (f"Active queue excludes {report_exclusions['excluded_call_type_tickets']} ticket(s) with Courtesy, Dealer Defective or Rework Order call types; "
+                "Note": (f"Active queue excludes {report_exclusions['excluded_call_type_tickets']} ticket(s) with {excluded_call_type_label()} call types; "
                          f"{report_exclusions['cancellation_request_tickets']} Cancellation Request verification ticket(s); and "
                          f"{report_exclusions['soft_closed_tickets']} soft-closed ticket(s). "
                          "Negative Response and Request for Re-Allocation statuses are retained."),
@@ -1150,7 +1274,7 @@ def analyze_reports(
             })
     dq_rows += [
         {"File": "Analysis rule", "Report Type": "Age-only ordering", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Days Old descending; oldest first", "Snapshot Used For": "", "Timestamp Basis": "Days Old column; Call Book Date used only if Days Old is blank", "Note": "The only call-ordering key is age. Equal-age tickets retain source order."},
-        {"File": "Analysis rule", "Report Type": "Active pending queue", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Active calls only", "Snapshot Used For": "", "Timestamp Basis": "Soft Closure Date / ClosedDate compared with Pending Call snapshot time", "Note": "Exclude Courtesy, Dealer Defective and Rework Order call types; Cancellation Request verification pending reasons; and soft-closed tickets. Retain Negative Response and Request for Re-Allocation statuses."},
+        {"File": "Analysis rule", "Report Type": "Active pending queue", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Active calls only", "Snapshot Used For": "", "Timestamp Basis": "Soft Closure Date / ClosedDate compared with Pending Call snapshot time", "Note": f"Exclude {excluded_call_type_label()} call types; Cancellation Request verification pending reasons; and soft-closed tickets. Retain Negative Response and Request for Re-Allocation statuses. Counting unit: distinct Ticket No."},
         {"File": "Analysis rule", "Report Type": "Snapshot comparison", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "New / continuing / no longer present / status changed / age increased", "Snapshot Used For": "", "Timestamp Basis": "Ticket-number matching on the active queue for each snapshot", "Note": "A ticket absent from a later Pending Call export is not automatically labelled closed."},
     ]
 
@@ -1197,6 +1321,9 @@ def analyze_reports(
         "franchise_summary": franchise_summary,
         "executive_summary": executive_summary,
         "age_summary": age_summary,
+        "age_pivot_executive": age_pivot(priorities, ["Service Executive Name"], "Executive"),
+        "age_pivot_franchise": age_pivot(priorities, ["Franchise Name"], "Franchise"),
+        "age_pivot_branch": age_pivot(priorities, [], "Branch"),
         "escalated": escalated,
         "repeat_calls": repeat_calls,
         "overdue_scheduled": overdue_scheduled,
@@ -1609,7 +1736,7 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
     status_col = find_col(top20, ["Status"])
     if len(top20):
         if exec_col:
-            exec_vals = top20[exec_col].map(lambda v: clean_text(v) or "Unspecified")
+            exec_vals = canonical_labels(top20[exec_col])
             counts = exec_vals.value_counts()
             top20["Executive % of Top 20"] = exec_vals.map(counts).astype(float) * 100 / len(top20)
             ex_summary = pd.DataFrame({"Executive": counts.index, "Top 20 Calls": counts.values})
@@ -1618,7 +1745,7 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
             top20["Executive % of Top 20"] = 100.0
             ex_summary = pd.DataFrame({"Executive": ["Unspecified"], "Top 20 Calls": [len(top20)], "Share of Top 20 (%)": [100.0]})
         if franchise_col:
-            fr_vals = top20[franchise_col].map(lambda v: clean_text(v) or "Unspecified")
+            fr_vals = canonical_labels(top20[franchise_col])
             counts_fr = fr_vals.value_counts()
             top20["Franchise % of Top 20"] = fr_vals.map(counts_fr).astype(float) * 100 / len(top20)
             fr_top_summary = pd.DataFrame({"Franchise": counts_fr.index, "Top 20 Calls": counts_fr.values})
@@ -1728,44 +1855,17 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
     scoped["status_summary"] = _simple_counts(priorities, ["Status"], "Status")
     scoped["call_type_summary"] = _simple_counts(priorities, ["Call Type"], "Call Type")
     scoped["pendency_reason_summary"], scoped["pendency_reason_metrics"] = _pendency_reason_outputs(priorities)
-    scoped["age_summary"] = pd.cut(
-        priorities["Days Old"], bins=[-1, 0, 2, 6, 13, 29, float("inf")],
-        labels=["0 days", "1–2 days", "3–6 days", "7–13 days", "14–29 days", "30+ days"],
-    ).value_counts(sort=False).rename_axis("Age Bucket").reset_index(name="Unique Tickets")
+    scoped["age_summary"] = _age_summary_frame(priorities)
     scoped["older_7"] = int((priorities["Days Old"] >= 7).sum())
     scoped["escalated"] = int(priorities.get("Has Escalation", pd.Series(False, index=priorities.index)).astype(bool).sum())
     scoped["repeat_calls"] = int(priorities.get("Is Repeat Call", pd.Series(False, index=priorities.index)).astype(bool).sum())
     scoped["overdue_scheduled"] = int(priorities.get("Scheduled Overdue", pd.Series(False, index=priorities.index)).astype(bool).sum())
 
-    franchise_col_all = find_col(priorities, ["Franchise Name"])
-    if franchise_col_all:
-        temp = priorities.copy()
-        temp["Franchise"] = temp[franchise_col_all].map(lambda v: clean_text(v) or "Unspecified")
-        scoped["franchise_summary"] = temp.groupby("Franchise", dropna=False).agg(
-            **{"Pending Tickets": ("Ticket No", "count"),
-               "Aged >2 Days": ("Days Old", lambda x: int((pd.to_numeric(x, errors="coerce").fillna(0) > 2).sum())),
-               "Aged 7+ Days": ("Days Old", lambda x: int((pd.to_numeric(x, errors="coerce").fillna(0) >= 7).sum())),
-               "Escalated Tickets": ("Has Escalation", lambda x: int(x.astype(bool).sum())),
-               "Repeat-call Flags": ("Is Repeat Call", lambda x: int(x.astype(bool).sum())),
-               "Average Age (days)": ("Days Old", lambda x: round(pd.to_numeric(x, errors="coerce").fillna(0).mean(), 1)),
-            }
-        ).reset_index().sort_values(["Aged >2 Days", "Pending Tickets"], ascending=False, kind="stable").reset_index(drop=True)
-    else:
-        scoped["franchise_summary"] = pd.DataFrame(columns=["Franchise", "Pending Tickets", "Aged >2 Days", "Aged 7+ Days", "Escalated Tickets", "Repeat-call Flags", "Average Age (days)"])
-
-    ex_col_all = find_col(priorities, ["Service Executive Name"])
-    if ex_col_all:
-        temp = priorities.copy()
-        temp["Executive"] = temp[ex_col_all].map(lambda v: clean_text(v) or "Unspecified")
-        scoped["executive_summary"] = temp.groupby("Executive", dropna=False).agg(
-            **{"Pending Tickets": ("Ticket No", "count"), "Aged 7+ Days": ("Days Old", lambda x: int((x >= 7).sum())),
-               "Escalated Tickets": ("Has Escalation", lambda x: int(x.astype(bool).sum())),
-               "Repeat-call Flags": ("Is Repeat Call", lambda x: int(x.astype(bool).sum())),
-               "Overdue Scheduled": ("Scheduled Overdue", lambda x: int(x.astype(bool).sum())),
-               "Average Age (days)": ("Days Old", lambda x: round(float(x.mean()), 1))}
-        ).reset_index().sort_values("Pending Tickets", ascending=False, kind="stable").reset_index(drop=True)
-    else:
-        scoped["executive_summary"] = pd.DataFrame(columns=["Executive", "Pending Tickets", "Aged 7+ Days", "Escalated Tickets", "Repeat-call Flags", "Overdue Scheduled", "Average Age (days)"])
+    scoped["franchise_summary"] = _franchise_summary_frame(priorities)
+    scoped["executive_summary"] = _executive_summary_frame(priorities)
+    scoped["age_pivot_executive"] = age_pivot(priorities, ["Service Executive Name"], "Executive")
+    scoped["age_pivot_franchise"] = age_pivot(priorities, ["Franchise Name"], "Franchise")
+    scoped["age_pivot_branch"] = age_pivot(priorities, [], "Branch")
 
     tech_col = find_col(priorities, ["Technician Name"])
     if tech_col:
@@ -2345,7 +2445,7 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     fig.lines.append(plt.Line2D([0.625, 0.625], [0.085, 0.215], transform=fig.transFigure, color="#E0E6EB", linewidth=0.8))
     fig.text(0.645, 0.202, "DATA NOTES", fontsize=7.8, color=teal, weight="bold", va="center")
     dq = analysis.get("data_quality_metrics", {})
-    exclude_line = (f"Excluded: {int(dq.get('excluded_call_type_tickets', 0)):,} Courtesy/Dealer Defective/Rework Order; "
+    exclude_line = (f"Excluded: {int(dq.get('excluded_call_type_tickets', 0)):,} {excluded_call_type_label()}; "
                     f"{int(dq.get('cancellation_request_tickets_excluded', 0)):,} cancellation-request; "
                     f"{int(dq.get('soft_closed_tickets_excluded', 0)):,} soft-closed. "
                     "Negative Response and Re-Allocation statuses remain included.")
@@ -2459,6 +2559,8 @@ def make_excel(analysis: Dict[str, Any]) -> bytes:
         tables.append(("Backlog by Franchise", analysis["franchise_summary"].copy()))
         tables.append(("Executive Workload", analysis["executive_summary"].copy()))
         tables.append(("Ageing Summary", analysis["age_summary"].copy()))
+        tables.append(("Age Pivot - Executive", analysis.get("age_pivot_executive", pd.DataFrame()).copy()))
+        tables.append(("Age Pivot - Franchise", analysis.get("age_pivot_franchise", pd.DataFrame()).copy()))
         tables.append(("Status Summary", analysis["status_summary"].copy()))
         tables.append(("CSAT Summary", analysis["csat_summary"].copy()))
         tables.append(("CSAT Snapshot Comparison", analysis["csat_comparison"].copy()))
