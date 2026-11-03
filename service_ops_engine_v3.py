@@ -268,6 +268,13 @@ def get_ticket_col(df: pd.DataFrame) -> Optional[str]:
 # Markers are matched after normalization so spacing, punctuation and capitalization
 # differences in CRM exports do not change the exclusion.
 _EXCLUDED_PENDING_CALL_TYPE_MARKERS = ("courtesy", "dealerdefective", "reworkorder")
+# Cancellation requests are recorded in Pending Reason in the standard CRM export,
+# not necessarily in Status. Match common wording variants after normalization.
+_EXCLUDED_PENDING_REASON_MARKERS = (
+    "cancellationrequest",
+    "requestforcancellation",
+    "reqforcancellation",
+)
 _EXCLUDED_PENDING_STATUS_MARKERS = {
     "negative_response": ("negativeresponse",),
     "reallocation": ("requestforreallocation",),
@@ -281,6 +288,17 @@ def excluded_pending_call_type_mask(df: pd.DataFrame) -> pd.Series:
         return pd.Series(False, index=df.index, dtype=bool)
     return df[call_type_col].map(
         lambda value: any(marker in norm(value) for marker in _EXCLUDED_PENDING_CALL_TYPE_MARKERS)
+    ).astype(bool)
+
+
+def excluded_pending_reason_mask(df: pd.DataFrame) -> pd.Series:
+    """Return True for pending-reason rows marked as a cancellation request."""
+    reason_col = find_col(df, ["Pending Reason", "Pendency Reason", "Reason for Pending"])
+    if reason_col is None:
+        return pd.Series(False, index=df.index, dtype=bool)
+    normalized = df[reason_col].map(norm)
+    return normalized.map(
+        lambda value: any(marker in value for marker in _EXCLUDED_PENDING_REASON_MARKERS)
     ).astype(bool)
 
 
@@ -556,10 +574,10 @@ def soft_closure_ticket_ids_as_of(reports: List[Dict[str, Any]], snapshot_dt: pd
 def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str, Any]]] = None) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
     """Return one row per active pending ticket plus its source rows and exclusion stats.
 
-    Exclusions: Courtesy, Dealer Defective and Rework Order call types; tickets with
-    Request for Re-Allocation or Negative Response statuses; and tickets soft-closed at
-    or before the snapshot timestamp. If any component row matches an exclusion, the
-    entire ticket is removed from the active queue.
+    Exclusions: Courtesy, Dealer Defective and Rework Order call types; cancellation
+    requests recorded in Pending Reason; Request for Re-Allocation or Negative Response
+    statuses; and tickets soft-closed at or before the snapshot timestamp. If any
+    component row matches an exclusion, the entire ticket is removed from the active queue.
     """
     reports = reports or [report]
     # Cache consolidation/exclusions within one analysis run. Snapshot comparison
@@ -583,20 +601,24 @@ def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str,
             "source_distinct_tickets": 0, "active_tickets": 0, "excluded_tickets": 0,
             "soft_closed_tickets": 0, "negative_response_tickets": 0,
             "reallocation_tickets": 0, "excluded_call_type_tickets": 0,
+            "cancellation_request_tickets": 0,
             "excluded_ticket_ids": set(), "active_ticket_ids": set(),
             "negative_response_ids": set(), "reallocation_ids": set(), "soft_closed_ids": set(),
-            "excluded_call_type_ids": set(),
+            "excluded_call_type_ids": set(), "cancellation_request_ids": set(),
         }
 
-    # A ticket is excluded as a whole if any component row carries an excluded call type.
+    # A ticket is excluded as a whole if any component row carries an excluded call type
+    # or a cancellation-request pending reason.
     raw_ticket_ids = {clean_text(v) for v in source_df[ticket_col_source].tolist() if clean_text(v)}
     call_type_mask = excluded_pending_call_type_mask(source_df)
     excluded_call_type_ids = _ticket_ids_for_mask(source_df, call_type_mask)
+    cancellation_reason_mask = excluded_pending_reason_mask(source_df)
+    cancellation_request_ids = _ticket_ids_for_mask(source_df, cancellation_reason_mask) - excluded_call_type_ids
     by_type = filter_pending_call_types(source_df)
     grouped = summarize_pending_rows(by_type)
     grouped_ticket_col = get_ticket_col(grouped)
     grouped_ids = {clean_text(v) for v in grouped[grouped_ticket_col].tolist() if clean_text(v)} if grouped_ticket_col else set()
-    candidate_ids = grouped_ids - excluded_call_type_ids
+    candidate_ids = grouped_ids - excluded_call_type_ids - cancellation_request_ids
 
     # Status exclusions also apply to the whole ticket, not only the matching source row.
     status_masks = excluded_pending_status_masks(by_type)
@@ -607,12 +629,11 @@ def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str,
     soft_closed_ids = soft_closure_ticket_ids_as_of(reports, snapshot_dt)
     soft_matched = candidate_ids & soft_closed_ids
 
-    # Keep exclusion categories mutually exclusive for clear management reconciliation:
-    # soft closure first, then negative response, then reallocation. Call-type exclusions
-    # are applied before these status/timestamp checks.
+    # Keep exclusion categories mutually exclusive for management reconciliation.
     negative_only = negative_ids - soft_matched
     reallocation_only = reallocation_ids - soft_matched - negative_ids
-    excluded_ids = excluded_call_type_ids | soft_matched | negative_ids | reallocation_ids
+    excluded_ids = (excluded_call_type_ids | cancellation_request_ids | soft_matched |
+                    negative_ids | reallocation_ids)
     active_ids = raw_ticket_ids - excluded_ids
 
     active_grouped = grouped[grouped[grouped_ticket_col].map(clean_text).isin(active_ids)].copy().reset_index(drop=True) if grouped_ticket_col else grouped.copy()
@@ -627,7 +648,9 @@ def active_pending_data(report: Dict[str, Any], reports: Optional[List[Dict[str,
         "negative_response_tickets": len(negative_only),
         "reallocation_tickets": len(reallocation_only),
         "excluded_call_type_tickets": len(excluded_call_type_ids),
+        "cancellation_request_tickets": len(cancellation_request_ids),
         "excluded_call_type_ids": excluded_call_type_ids,
+        "cancellation_request_ids": cancellation_request_ids,
         "reallocation_ids": reallocation_only,
         "excluded_ticket_ids": excluded_ids,
         "active_ticket_ids": active_ids,
@@ -1075,6 +1098,7 @@ def analyze_reports(
         "soft_closed_tickets_excluded": current_exclusion_stats["soft_closed_tickets"],
         "negative_response_tickets_excluded": current_exclusion_stats["negative_response_tickets"],
         "reallocation_tickets_excluded": current_exclusion_stats["reallocation_tickets"],
+        "cancellation_request_tickets_excluded": current_exclusion_stats["cancellation_request_tickets"],
         "excluded_call_type_tickets": current_exclusion_stats["excluded_call_type_tickets"],
         "current_source_distinct_tickets": current_exclusion_stats["source_distinct_tickets"],
     }
@@ -1098,6 +1122,7 @@ def analyze_reports(
                 "Period": r["metadata"], "Snapshot Used For": r["snapshot_dt"].strftime("%Y-%m-%d %H:%M"),
                 "Timestamp Basis": r["snapshot_source"],
                 "Note": (f"Active queue excludes {report_exclusions['excluded_call_type_tickets']} ticket(s) with Courtesy, Dealer Defective or Rework Order call types; "
+                         f"{report_exclusions['cancellation_request_tickets']} Cancellation Request verification ticket(s); "
                          f"{report_exclusions['soft_closed_tickets']} soft-closed ticket(s); "
                          f"{report_exclusions['negative_response_tickets']} Negative Response ticket(s); and "
                          f"{report_exclusions['reallocation_tickets']} Request for Re-Allocation ticket(s)."),
@@ -1122,7 +1147,7 @@ def analyze_reports(
             })
     dq_rows += [
         {"File": "Analysis rule", "Report Type": "Age-only ordering", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Days Old descending; oldest first", "Snapshot Used For": "", "Timestamp Basis": "Days Old column; Call Book Date used only if Days Old is blank", "Note": "The only call-ordering key is age. Equal-age tickets retain source order."},
-        {"File": "Analysis rule", "Report Type": "Active pending queue", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Active calls only", "Snapshot Used For": "", "Timestamp Basis": "Soft Closure Date / ClosedDate compared with Pending Call snapshot time", "Note": "Exclude Courtesy, Dealer Defective and Rework Order call types; soft-closed tickets; Negative Response from Customer; and Request for Re-Allocation status."},
+        {"File": "Analysis rule", "Report Type": "Active pending queue", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "Active calls only", "Snapshot Used For": "", "Timestamp Basis": "Soft Closure Date / ClosedDate compared with Pending Call snapshot time", "Note": "Exclude Courtesy, Dealer Defective and Rework Order call types; Cancellation Request verification pending reasons; soft-closed tickets; Negative Response from Customer; and Request for Re-Allocation status."},
         {"File": "Analysis rule", "Report Type": "Snapshot comparison", "Source Rows": "", "Distinct Tickets": "", "Eligible Rows": "", "Eligible Tickets": "", "Excluded Rows": "", "Excluded Tickets": "", "Rows beyond distinct tickets": "", "Period": "New / continuing / no longer present / status changed / age increased", "Snapshot Used For": "", "Timestamp Basis": "Ticket-number matching on the active queue for each snapshot", "Note": "A ticket absent from a later Pending Call export is not automatically labelled closed."},
     ]
 
@@ -1139,6 +1164,7 @@ def analyze_reports(
         "soft_closed_tickets_excluded": current_exclusion_stats["soft_closed_tickets"],
         "negative_response_tickets_excluded": current_exclusion_stats["negative_response_tickets"],
         "reallocation_tickets_excluded": current_exclusion_stats["reallocation_tickets"],
+        "cancellation_request_tickets_excluded": current_exclusion_stats["cancellation_request_tickets"],
         "excluded_call_type_tickets": current_exclusion_stats["excluded_call_type_tickets"],
         "prior_unique_tickets": len(active_pending_data(previous, reports)[0]) if previous else None,
         "excluded_pending_rows": excluded_pending_rows,
@@ -1632,7 +1658,9 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
     call_type_exclusion_mask_scoped = excluded_pending_call_type_mask(current_source_scoped)
     call_type_excluded_ids_scoped = _ticket_ids_for_mask(current_source_scoped, call_type_exclusion_mask_scoped)
     filtered_source_scoped = current_source_scoped.loc[~call_type_exclusion_mask_scoped].copy()
-    candidate_scope_ids = raw_scope_ids - call_type_excluded_ids_scoped
+    cancellation_reason_mask_scoped = excluded_pending_reason_mask(filtered_source_scoped)
+    cancellation_request_ids_scoped = _ticket_ids_for_mask(filtered_source_scoped, cancellation_reason_mask_scoped)
+    candidate_scope_ids = raw_scope_ids - call_type_excluded_ids_scoped - cancellation_request_ids_scoped
     scoped["current_source_distinct_tickets"] = len(raw_scope_ids)
     active_ids = set(priorities["Ticket No"].map(clean_text)) if "Ticket No" in priorities.columns else set()
 
@@ -1658,6 +1686,7 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
     scoped["soft_closed_tickets_excluded"] = len(soft_ids)
     scoped["negative_response_tickets_excluded"] = len(negative_only)
     scoped["reallocation_tickets_excluded"] = len(reallocation_only)
+    scoped["cancellation_request_tickets_excluded"] = len(cancellation_request_ids_scoped)
     scoped["excluded_pending_tickets"] = len(raw_scope_ids - active_ids)
     scoped["excluded_pending_rows"] = (int((~current_source_scoped[ticket_col].map(clean_text).isin(active_ids)).sum())
                                         if ticket_col else len(current_source_scoped))
@@ -1785,6 +1814,7 @@ def scope_analysis(analysis: Dict[str, Any], scope_mode: str = "branch", selecti
         "soft_closed_tickets_excluded": len(soft_ids),
         "negative_response_tickets_excluded": len(negative_only),
         "reallocation_tickets_excluded": len(reallocation_only),
+        "cancellation_request_tickets_excluded": len(cancellation_request_ids_scoped),
         "excluded_call_type_tickets": len(call_type_excluded_ids_scoped),
         "current_source_distinct_tickets": len(raw_scope_ids),
     }
@@ -2313,6 +2343,7 @@ def make_management_png(analysis: Dict[str, Any]) -> bytes:
     fig.text(0.645, 0.202, "DATA NOTES", fontsize=7.8, color=teal, weight="bold", va="center")
     dq = analysis.get("data_quality_metrics", {})
     exclude_line = (f"Excluded: {int(dq.get('excluded_call_type_tickets', 0)):,} Courtesy/Dealer Defective/Rework Order; "
+                    f"{int(dq.get('cancellation_request_tickets_excluded', 0)):,} cancellation-request; "
                     f"{int(dq.get('soft_closed_tickets_excluded', 0)):,} soft-closed; "
                     f"{int(dq.get('negative_response_tickets_excluded', 0)):,} negative-response; "
                     f"{int(dq.get('reallocation_tickets_excluded', 0)):,} re-allocation.")
